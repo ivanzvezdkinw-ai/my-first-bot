@@ -125,7 +125,9 @@ class Database:
                 losses INTEGER DEFAULT 0,
                 last_duel_time TIMESTAMP,
                 casino_wins INTEGER DEFAULT 0,
-                casino_losses INTEGER DEFAULT 0
+                casino_losses INTEGER DEFAULT 0,
+                last_bonus_date DATE,
+                bonus_streak INTEGER DEFAULT 0
             )
         ''')
 
@@ -174,7 +176,9 @@ class Database:
                 'casino_wins': 'INTEGER DEFAULT 0',
                 'casino_losses': 'INTEGER DEFAULT 0',
                 'daily_taps': 'INTEGER DEFAULT 0',
-                'last_tap_date': 'DATE'
+                'last_tap_date': 'DATE',
+                'last_bonus_date': 'DATE',
+                'bonus_streak': 'INTEGER DEFAULT 0'
             }
 
             for col_name, col_type in columns_to_add.items():
@@ -301,8 +305,9 @@ class Database:
                 INSERT INTO users (
                     user_id, username, first_name, robux, taps, daily_taps, last_tap_date,
                     click_power, auto_clickers, last_tap_time, joined_date, 
-                    wins, losses, last_duel_time, casino_wins, casino_losses
-                ) VALUES (?, ?, ?, 0, 0, 0, ?, 1, 0, ?, ?, 0, 0, ?, 0, 0)
+                    wins, losses, last_duel_time, casino_wins, casino_losses,
+                    last_bonus_date, bonus_streak
+                ) VALUES (?, ?, ?, 0, 0, 0, ?, 1, 0, ?, ?, 0, 0, ?, 0, 0, NULL, 0)
             ''', (user_id, username, first_name, today, now, now, now))
             self.conn.commit()
             
@@ -617,17 +622,6 @@ class Database:
             }
 
 
-# ==================== ФУНКЦИЯ АВТОБЭКАПА ====================
-
-async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое создание резервной копии каждый час"""
-    try:
-        db.backup_database()
-        logger.info("⏰ Автоматический бэкап выполнен")
-    except Exception as e:
-        logger.error(f"❌ Ошибка авто-бэкапа: {e}")
-
-
 # Инициализация БД
 db = Database()
 
@@ -650,7 +644,9 @@ def get_main_keyboard():
         [KeyboardButton("👆 ТАПНУТЬ")],
         [KeyboardButton("🏪 Магазин"), KeyboardButton("⚔️ Дуэли")],
         [KeyboardButton("🎰 Казино"), KeyboardButton("📊 Статистика")],
-        [KeyboardButton("🏆 Топ игроков"), KeyboardButton("ℹ️ Информация")]
+        [KeyboardButton("🎁 Бонус"), KeyboardButton("🏆 Достижения")],
+        [KeyboardButton("🎮 Игры"), KeyboardButton("🏆 Топ игроков")],
+        [KeyboardButton("ℹ️ Информация")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -686,10 +682,12 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         losses = user_data['losses']
         casino_wins = user_data['casino_wins']
         casino_losses = user_data['casino_losses']
+        bonus_streak = user_data['bonus_streak'] if user_data['bonus_streak'] else 0
     else:
         robux = taps = daily_taps = wins = losses = casino_wins = casino_losses = 0
         click_power = 1
         auto_clickers = 0
+        bonus_streak = 0
 
     tap_value = TAP_BASE_VALUE * click_power
     win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
@@ -702,6 +700,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👆 Тапов сегодня: **{daily_taps}/{MAX_DAILY_TAPS}**\n"
             f"⚡ Один тап: **{tap_value:.2f}💰** (x{click_power})\n"
             f"🤖 Автокликеров: **{auto_clickers}**\n"
+            f"🔥 Стрик бонуса: **{bonus_streak} дней**\n"
             f"⚔️ Дуэли: {wins}W / {losses}L ({win_rate:.1f}%)\n"
             f"🎰 Казино: {casino_wins}W / {casino_losses}L ({casino_rate:.1f}%)\n"
             f"📊 Осталось тапов: {remaining_taps}")
@@ -873,6 +872,9 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• ⚔️ Дуэли - сражаться (везде)\n"
         f"• 🎰 Казино - {CASINO_WIN_RATE}% шанс (везде)\n"
         "• 📊 Статистика - прогресс (только в личке)\n"
+        "• 🎁 Ежедневный бонус - заходи каждый день!\n"
+        "• 🏆 Достижения - выполняй задания\n"
+        "• 🎮 Мини-игры - Угадай число, КНБ\n"
         "• 🏆 Топ - лидеры (везде)\n\n"
         "📝 **Команды:**\n"
         "/start - главное меню\n"
@@ -1532,6 +1534,380 @@ async def auto_clicker_job(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка автокликера: {e}")
 
 
+# ==================== ЕЖЕДНЕВНЫЕ БОНУСЫ ====================
+
+async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение ежедневного бонуса"""
+    user_id = update.effective_user.id
+    today = date.today().isoformat()
+    
+    user_data = db.get_user(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Сначала напиши /start")
+        return
+    
+    last_bonus = user_data.get('last_bonus_date')
+    streak = user_data.get('bonus_streak', 0)
+    
+    # Проверяем, можно ли получить бонус
+    if last_bonus == today:
+        await update.message.reply_text("⏳ Ты уже получил бонус сегодня! Приходи завтра.")
+        return
+    
+    # Рассчитываем бонус
+    base_bonus = 50  # Базовый бонус
+    
+    # Проверяем, был ли бонус вчера (для streak)
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    if last_bonus == yesterday:
+        streak += 1
+        streak_bonus = min(streak * 10, 100)  # Максимум +100 за стрик
+    else:
+        streak = 1
+        streak_bonus = 0
+    
+    total_bonus = base_bonus + streak_bonus
+    
+    # Обновляем баланс
+    db.cursor.execute('''
+        UPDATE users 
+        SET robux = robux + ?, last_bonus_date = ?, bonus_streak = ? 
+        WHERE user_id = ?
+    ''', (total_bonus, today, streak, user_id))
+    db.conn.commit()
+    
+    text = (f"🎁 **ЕЖЕДНЕВНЫЙ БОНУС!**\n\n"
+            f"💰 Получено: +{total_bonus}💰\n"
+            f"📅 База: {base_bonus}💰\n"
+            f"🔥 Стрик: {streak} дней (+{streak_bonus}💰)\n\n"
+            f"Заходи завтра за новым бонусом!")
+    
+    await update.message.reply_text(text)
+
+
+# ==================== ДОСТИЖЕНИЯ ====================
+
+async def show_achievements(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать достижения пользователя"""
+    user_id = update.effective_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data:
+        await update.message.reply_text("❌ Сначала напиши /start")
+        return
+    
+    # Проверяем и обновляем достижения
+    achievements = []
+    
+    # Тапер
+    if user_data['taps'] >= 1000:
+        achievements.append("🥇 **Тапер-профи** - 1000+ тапов")
+    elif user_data['taps'] >= 100:
+        achievements.append("🥈 **Тапер-любитель** - 100+ тапов")
+    elif user_data['taps'] >= 10:
+        achievements.append("🥉 **Новичок** - 10+ тапов")
+    
+    # Богач
+    if user_data['robux'] >= 10000:
+        achievements.append("💰 **Миллионер** - 10000+ робуксов")
+    elif user_data['robux'] >= 1000:
+        achievements.append("💰 **Богач** - 1000+ робуксов")
+    elif user_data['robux'] >= 100:
+        achievements.append("💰 **Трудяга** - 100+ робуксов")
+    
+    # Дуэли
+    total_duels = user_data['wins'] + user_data['losses']
+    if total_duels >= 100:
+        achievements.append("⚔️ **Легенда арены** - 100+ дуэлей")
+    elif total_duels >= 10:
+        achievements.append("⚔️ **Опытный боец** - 10+ дуэлей")
+    elif total_duels >= 1:
+        achievements.append("⚔️ **Новичок арены** - первая дуэль")
+    
+    if user_data['wins'] >= 50:
+        achievements.append("🏆 **Чемпион** - 50+ побед в дуэлях")
+    
+    # Казино
+    total_casino = user_data['casino_wins'] + user_data['casino_losses']
+    if total_casino >= 100:
+        achievements.append("🎰 **Завсегдатай казино** - 100+ игр")
+    elif total_casino >= 10:
+        achievements.append("🎰 **Игрок** - 10+ игр в казино")
+    
+    if user_data['casino_wins'] >= 10:
+        achievements.append("🍀 **Везунчик** - 10+ побед в казино")
+    
+    # Сила клика
+    if user_data['click_power'] >= 10:
+        achievements.append("⚡ **Бог тапа** - сила клика x10")
+    elif user_data['click_power'] >= 5:
+        achievements.append("⚡ **Мастер тапа** - сила клика x5")
+    
+    # Автокликеры
+    if user_data['auto_clickers'] >= 5:
+        achievements.append("🤖 **Магнат** - 5+ автокликеров")
+    
+    if not achievements:
+        achievements = ["🎯 Нет достижений. Играй, чтобы получить их!"]
+    
+    text = "🏆 **ТВОИ ДОСТИЖЕНИЯ** 🏆\n\n"
+    text += "\n".join(achievements)
+    
+    keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data='refresh_achievements')]]
+    
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+# ==================== МИНИ-ИГРЫ ====================
+
+# ---------- Угадай число ----------
+async def game_guess_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать игру Угадай число"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    user_data = db.get_user(user_id)
+    
+    if not user_data or user_data['robux'] < 100:
+        await query.edit_message_text("❌ Для игры нужно 100💰!")
+        return
+    
+    # Списываем плату за игру
+    db.cursor.execute("UPDATE users SET robux = robux - 100 WHERE user_id = ?", (user_id,))
+    db.conn.commit()
+    
+    secret = random.randint(1, 50)
+    context.user_data['guess_game'] = {
+        'secret': secret,
+        'attempts': 0,
+        'max_attempts': 5
+    }
+    
+    text = (f"🎲 **УГАДАЙ ЧИСЛО**\n\n"
+            f"💰 Стоимость игры: 100💰\n"
+            f"🎯 Загадано число от 1 до 50\n"
+            f"📊 У тебя 5 попыток\n\n"
+            f"Введи число:")
+    
+    keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data='game_cancel')]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data['game_mode'] = 'guess'
+
+
+async def game_guess_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка ответа в игре Угадай число"""
+    if 'guess_game' not in context.user_data:
+        return False
+    
+    user_id = update.effective_user.id
+    game = context.user_data['guess_game']
+    
+    try:
+        guess = int(update.message.text)
+    except ValueError:
+        await update.message.reply_text("❌ Введи число!")
+        return True
+    
+    game['attempts'] += 1
+    
+    if guess == game['secret']:
+        # Победа - выигрыш от 150 до 300
+        win_amount = random.randint(150, 300)
+        db.cursor.execute("UPDATE users SET robux = robux + ? WHERE user_id = ?", 
+                         (win_amount, user_id))
+        db.conn.commit()
+        
+        await update.message.reply_text(
+            f"🎉 **ПОБЕДА!**\n\n"
+            f"Ты угадал число {game['secret']} за {game['attempts']} попыток!\n"
+            f"💰 Выигрыш: +{win_amount}💰"
+        )
+        del context.user_data['guess_game']
+        del context.user_data['game_mode']
+        
+    elif guess < game['secret']:
+        await update.message.reply_text(f"📈 Моё число БОЛЬШЕ (осталось {game['max_attempts'] - game['attempts']} попыток)")
+    else:
+        await update.message.reply_text(f"📉 Моё число МЕНЬШЕ (осталось {game['max_attempts'] - game['attempts']} попыток)")
+    
+    # Проверка на проигрыш
+    if game['attempts'] >= game['max_attempts'] and guess != game['secret']:
+        await update.message.reply_text(
+            f"😢 Ты проиграл!\n"
+            f"Я загадал число: {game['secret']}"
+        )
+        del context.user_data['guess_game']
+        del context.user_data['game_mode']
+    
+    return True
+
+
+# ---------- Камень-ножницы-бумага ----------
+async def game_rps_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню игры Камень-ножницы-бумага"""
+    query = update.callback_query
+    await query.answer()
+    
+    text = "🪨 **КАМЕНЬ-НОЖНИЦЫ-БУМАГА** 📄✂️\n\nВыбери ставку:"
+    
+    keyboard = [
+        [InlineKeyboardButton("50💰", callback_data='rps_50'),
+         InlineKeyboardButton("100💰", callback_data='rps_100'),
+         InlineKeyboardButton("200💰", callback_data='rps_200')],
+        [InlineKeyboardButton("◀ Назад", callback_data='back_to_games')]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def game_rps_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать игру КНБ"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    bet = int(query.data.split('_')[1])
+    
+    user_data = db.get_user(user_id)
+    if not user_data or user_data['robux'] < bet:
+        await query.answer("❌ Недостаточно средств!", show_alert=True)
+        return
+    
+    context.user_data['rps_bet'] = bet
+    context.user_data['rps_active'] = True
+    
+    # Списываем ставку временно
+    db.cursor.execute("UPDATE users SET robux = robux - ? WHERE user_id = ?", (bet, user_id))
+    db.conn.commit()
+    
+    text = (f"🪨 **КНБ** | Ставка: {bet}💰\n\n"
+            f"Выбери:")
+    
+    keyboard = [
+        [InlineKeyboardButton("🪨 Камень", callback_data='rps_rock'),
+         InlineKeyboardButton("📄 Бумага", callback_data='rps_paper'),
+         InlineKeyboardButton("✂️ Ножницы", callback_data='rps_scissors')],
+        [InlineKeyboardButton("❌ Отмена", callback_data='rps_cancel')]
+    ]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def game_rps_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Результат игры КНБ"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    choice = query.data.split('_')[1]
+    
+    if not context.user_data.get('rps_active'):
+        await query.answer("❌ Игра не активна", show_alert=True)
+        return
+    
+    bet = context.user_data['rps_bet']
+    
+    # Выбор бота
+    bot_choice = random.choice(['rock', 'paper', 'scissors'])
+    
+    choices_emoji = {
+        'rock': '🪨', 'paper': '📄', 'scissors': '✂️'
+    }
+    choices_names = {
+        'rock': 'Камень', 'paper': 'Бумага', 'scissors': 'Ножницы'
+    }
+    
+    # Определяем победителя
+    win = False
+    if choice == bot_choice:
+        result = "🤝 Ничья!"
+        win_amount = bet  # Возврат ставки
+    elif (choice == 'rock' and bot_choice == 'scissors') or \
+         (choice == 'paper' and bot_choice == 'rock') or \
+         (choice == 'scissors' and bot_choice == 'paper'):
+        result = "🎉 Ты выиграл!"
+        win_amount = bet * 2
+        win = True
+    else:
+        result = "😢 Ты проиграл!"
+        win_amount = 0
+        win = False
+    
+    # Обновляем баланс
+    if win:
+        db.cursor.execute("UPDATE users SET robux = robux + ? WHERE user_id = ?", (win_amount, user_id))
+    db.conn.commit()
+    
+    text = (f"🪨 **КНБ** | Ставка: {bet}💰\n\n"
+            f"Ты: {choices_emoji[choice]} {choices_names[choice]}\n"
+            f"Бот: {choices_emoji[bot_choice]} {choices_names[bot_choice]}\n\n"
+            f"**{result}**\n"
+            f"💰 Итог: {'+' if win else ''}{win_amount - bet}💰")
+    
+    keyboard = [[InlineKeyboardButton("🎮 Ещё", callback_data='back_to_games')]]
+    
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data.pop('rps_active', None)
+    context.user_data.pop('rps_bet', None)
+
+
+async def game_rps_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена игры КНБ"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    
+    if 'rps_bet' in context.user_data:
+        # Возвращаем ставку
+        bet = context.user_data['rps_bet']
+        db.cursor.execute("UPDATE users SET robux = robux + ? WHERE user_id = ?", (bet, user_id))
+        db.conn.commit()
+    
+    context.user_data.pop('rps_active', None)
+    context.user_data.pop('rps_bet', None)
+    
+    await query.answer("❌ Игра отменена")
+    await game_rps_menu(update, context)
+
+
+# ---------- Общее меню игр ----------
+async def show_games_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главное меню игр"""
+    text = "🎮 **МИНИ-ИГРЫ** 🎮\n\nВыбери игру:"
+    
+    keyboard = [
+        [InlineKeyboardButton("🎲 Угадай число (100💰)", callback_data='game_guess_start')],
+        [InlineKeyboardButton("🪨 Камень-ножницы-бумага", callback_data='game_rps_menu')],
+        [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
+    ]
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def games_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Вернуться в меню игр"""
+    query = update.callback_query
+    await query.answer()
+    await show_games_menu(update, context)
+
+
+async def game_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена любой игры"""
+    query = update.callback_query
+    context.user_data.pop('guess_game', None)
+    context.user_data.pop('game_mode', None)
+    context.user_data.pop('rps_active', None)
+    if 'rps_bet' in context.user_data:
+        # Возвращаем ставку если была
+        user_id = query.from_user.id
+        bet = context.user_data['rps_bet']
+        db.cursor.execute("UPDATE users SET robux = robux + ? WHERE user_id = ?", (bet, user_id))
+        db.conn.commit()
+        context.user_data.pop('rps_bet', None)
+    
+    await query.answer("❌ Игра отменена")
+    await show_games_menu(update, context)
+
+
 # ==================== ГЛАВНЫЙ ОБРАБОТЧИК КНОПОК ====================
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1551,6 +1927,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == 'refresh_top':
             await query.answer()
             await show_top(update, context)
+            
+        elif data == 'refresh_achievements':
+            await query.answer()
+            await show_achievements(update, context)
+            
+        elif data == 'back_to_games':
+            await query.answer()
+            await show_games_menu(update, context)
+            
+        elif data == 'game_guess_start':
+            await game_guess_start(update, context)
+            
+        elif data == 'game_rps_menu':
+            await game_rps_menu(update, context)
+            
+        elif data == 'game_cancel':
+            await game_cancel(update, context)
+            
+        elif data.startswith('rps_'):
+            if data == 'rps_cancel':
+                await game_rps_cancel(update, context)
+            elif data in ['rps_50', 'rps_100', 'rps_200']:
+                await game_rps_play(update, context)
+            elif data in ['rps_rock', 'rps_paper', 'rps_scissors']:
+                await game_rps_result(update, context)
 
         elif data.startswith('casino_'):
             if data in ['casino_cancel', 'casino_back']:
@@ -1590,6 +1991,12 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_type = update.effective_chat.type
 
+    # Проверка на активную игру
+    if 'game_mode' in context.user_data and context.user_data['game_mode'] == 'guess':
+        handled = await game_guess_handle(update, context)
+        if handled:
+            return
+
     if 'casino_mode' in context.user_data:
         await casino_handle_message(update, context)
         return
@@ -1614,10 +2021,27 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_casino(update, context)
         elif text == "📊 Статистика":
             await show_stats(update, context)
+        elif text == "🎁 Бонус":
+            await daily_bonus(update, context)
+        elif text == "🏆 Достижения":
+            await show_achievements(update, context)
+        elif text == "🎮 Игры":
+            await show_games_menu(update, context)
         elif text == "🏆 Топ игроков":
             await show_top(update, context)
         elif text == "ℹ️ Информация":
             await show_info(update, context)
+
+
+# ==================== ФУНКЦИЯ АВТОБЭКАПА ====================
+
+async def auto_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Автоматическое создание резервной копии каждый час"""
+    try:
+        db.backup_database()
+        logger.info("⏰ Автоматический бэкап выполнен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка авто-бэкапа: {e}")
 
 
 # ==================== ФУНКЦИЯ АВТОПЕРЕЗАПУСКА ====================
