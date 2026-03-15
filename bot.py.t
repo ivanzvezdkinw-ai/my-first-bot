@@ -13,7 +13,8 @@ from telegram.constants import ParseMode
 from telegram.error import TelegramError, NetworkError, TimedOut
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8681184073:AAGdu67tjipTDSgZcu1sACtY0yDgg-RoXf4"
+# Берем токен из переменных окружения (для безопасности)
+BOT_TOKEN = os.getenv('BOT_TOKEN', "8681184073:AAGdu67tjipTDSgZcu1sACtY0yDgg-RoXf4")
 ADMIN_ID = 7128369499  # Твой ID
 
 # НАСТРОЙКИ ТАПОВ
@@ -33,10 +34,6 @@ DUEL_BET_MAX = 10000
 CASINO_MIN_BET = 5
 CASINO_MAX_BET = 5000
 CASINO_WIN_RATE = 30  # 30% шанс победы
-
-# Настройка автоудаления (в секундах)
-DELETE_GROUP_MESSAGES = 30  # Сообщения в группах удаляются через 30 секунд
-DELETE_PRIVATE_MESSAGES = 0  # 0 = не удалять в личке
 
 # Настройка логирования
 logging.basicConfig(
@@ -103,7 +100,7 @@ class Database:
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 first_name TEXT,
-                robux REAL DEFAULT 0,  -- Изменено на REAL для дробных значений
+                robux REAL DEFAULT 0,
                 taps INTEGER DEFAULT 0,
                 daily_taps INTEGER DEFAULT 0,
                 last_tap_date DATE,
@@ -152,6 +149,32 @@ class Database:
             )
         ''')
 
+        # Проверка и добавление новых колонок
+        try:
+            self.cursor.execute("PRAGMA table_info(users)")
+            existing_columns = [col[1] for col in self.cursor.fetchall()]
+
+            columns_to_add = {
+                'wins': 'INTEGER DEFAULT 0',
+                'losses': 'INTEGER DEFAULT 0',
+                'last_duel_time': 'TIMESTAMP',
+                'casino_wins': 'INTEGER DEFAULT 0',
+                'casino_losses': 'INTEGER DEFAULT 0',
+                'daily_taps': 'INTEGER DEFAULT 0',
+                'last_tap_date': 'DATE'
+            }
+
+            for col_name, col_type in columns_to_add.items():
+                if col_name not in existing_columns:
+                    try:
+                        self.cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+                        self.conn.commit()
+                        logger.info(f"✅ Добавлена колонка {col_name}")
+                    except Exception as e:
+                        logger.error(f"⚠️ Ошибка при добавлении {col_name}: {e}")
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка при проверке колонок: {e}")
+
         # Добавляем chat_id если его нет
         try:
             self.cursor.execute("PRAGMA table_info(active_duels)")
@@ -162,29 +185,6 @@ class Database:
                 logger.info("✅ Добавлена колонка chat_id в таблицу active_duels")
         except Exception as e:
             logger.error(f"⚠️ Ошибка при добавлении chat_id: {e}")
-
-        # Проверка и добавление новых колонок
-        self.cursor.execute("PRAGMA table_info(users)")
-        existing_columns = [col[1] for col in self.cursor.fetchall()]
-
-        columns_to_add = {
-            'wins': 'INTEGER DEFAULT 0',
-            'losses': 'INTEGER DEFAULT 0',
-            'last_duel_time': 'TIMESTAMP',
-            'casino_wins': 'INTEGER DEFAULT 0',
-            'casino_losses': 'INTEGER DEFAULT 0',
-            'daily_taps': 'INTEGER DEFAULT 0',
-            'last_tap_date': 'DATE'
-        }
-
-        for col_name, col_type in columns_to_add.items():
-            if col_name not in existing_columns:
-                try:
-                    self.cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
-                    self.conn.commit()
-                    logger.info(f"✅ Добавлена колонка {col_name}")
-                except Exception as e:
-                    logger.error(f"⚠️ Ошибка при добавлении {col_name}: {e}")
 
         self.conn.commit()
 
@@ -380,14 +380,12 @@ class Database:
             win = random.randint(1, 100) <= CASINO_WIN_RATE
 
             if win:
-                winnings = bet_amount * 2  # x2 при выигрыше
+                winnings = bet_amount * 2
                 self.cursor.execute('''
                     UPDATE users 
                     SET robux = robux + ?, casino_wins = casino_wins + 1 
                     WHERE user_id = ?
-                ''', (bet_amount, user_id))  # +bet_amount потому что ставка уже была списана?
-                # Правильнее: robux = robux + bet_amount (возврат ставки + выигрыш)
-                # Но обычно в казино: поставил 10, выиграл 20 (чистый выигрыш 10)
+                ''', (bet_amount, user_id))  # +bet_amount (возврат ставки + выигрыш)
                 result_text = "ВЫИГРАЛ"
             else:
                 self.cursor.execute('''
@@ -580,59 +578,14 @@ class Database:
 db = Database()
 
 
-# ==================== ФУНКЦИИ АВТОУДАЛЕНИЯ ====================
+# ==================== ПРОВЕРКА ТИПА ЧАТА ====================
 
-async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
-    """Автоматическое удаление сообщений"""
-    job = context.job
-    try:
-        await context.bot.delete_message(chat_id=job.chat_id, message_id=job.data)
-        logger.info(f"🗑️ Удалено сообщение {job.data} в чате {job.chat_id}")
-    except Exception as e:
-        logger.error(f"❌ Не удалось удалить сообщение: {e}")
+def is_private(update: Update):
+    return update.effective_chat.type == "private"
 
 
-async def send_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None,
-                          delete_after=None):
-    """Отправить сообщение и запланировать удаление"""
-    chat_type = update.effective_chat.type
-
-    if delete_after is not None:
-        seconds = delete_after
-    elif chat_type in ['group', 'supergroup']:
-        seconds = DELETE_GROUP_MESSAGES
-    else:
-        seconds = DELETE_PRIVATE_MESSAGES
-
-    if update.callback_query:
-        message = await update.callback_query.message.reply_text(text, reply_markup=reply_markup,
-                                                                 parse_mode=ParseMode.MARKDOWN)
-    else:
-        message = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-
-    if seconds > 0:
-        context.job_queue.run_once(auto_delete, seconds, data=message.message_id, chat_id=message.chat_id)
-        logger.info(f"⏰ Сообщение {message.message_id} будет удалено через {seconds} сек")
-
-    return message
-
-
-async def edit_and_delete(query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, delete_after=None):
-    """Изменить сообщение и запланировать удаление"""
-    chat_type = query.message.chat.type
-
-    if delete_after is not None:
-        seconds = delete_after
-    elif chat_type in ['group', 'supergroup']:
-        seconds = DELETE_GROUP_MESSAGES
-    else:
-        seconds = DELETE_PRIVATE_MESSAGES
-
-    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-
-    if seconds > 0:
-        context.job_queue.run_once(auto_delete, seconds, data=query.message.message_id, chat_id=query.message.chat_id)
-        logger.info(f"⏰ Сообщение {query.message.message_id} будет удалено через {seconds} сек")
+def is_group(update: Update):
+    return update.effective_chat.type in ["group", "supergroup"]
 
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -657,22 +610,13 @@ def get_group_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
-# ==================== ПРОВЕРКА ТИПА ЧАТА ====================
-
-def is_private(update: Update):
-    return update.effective_chat.type == "private"
-
-
-def is_group(update: Update):
-    return update.effective_chat.type in ["group", "supergroup"]
-
-
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
-        await send_and_delete(update, context,
-                              "❌ Это меню доступно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        await update.message.reply_text(
+            "❌ Это меню доступно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot"
+        )
         return
 
     user = update.effective_user
@@ -782,7 +726,7 @@ async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data='refresh_top')]]
 
-    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== КОМАНДА ВЫДАЧИ РОБУКСОВ ====================
@@ -791,40 +735,40 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id != ADMIN_ID:
-        await send_and_delete(update, context, "⛔ Эта команда только для администратора!")
+        await update.message.reply_text("⛔ Эта команда только для администратора!")
         return
 
     if len(context.args) < 2:
-        await send_and_delete(update, context,
-                              "❌ Неправильный формат!\n"
-                              "Используй: `/give @username сумма`\n"
-                              "Или: `/give ID сумма`\n\n"
-                              "Примеры:\n"
-                              "`/give @durov 100`\n"
-                              "`/give 123456789 500`",
-                              delete_after=30
-                              )
+        await update.message.reply_text(
+            "❌ Неправильный формат!\n"
+            "Используй: `/give @username сумма`\n"
+            "Или: `/give ID сумма`\n\n"
+            "Примеры:\n"
+            "`/give @durov 100`\n"
+            "`/give 123456789 500`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     target = context.args[0]
     try:
         amount = float(context.args[1])
     except ValueError:
-        await send_and_delete(update, context, "❌ Сумма должна быть числом!", delete_after=10)
+        await update.message.reply_text("❌ Сумма должна быть числом!")
         return
 
     if amount <= 0:
-        await send_and_delete(update, context, "❌ Сумма должна быть положительной!", delete_after=10)
+        await update.message.reply_text("❌ Сумма должна быть положительной!")
         return
 
     if amount > 1000000:
-        await send_and_delete(update, context, "❌ Максимальная сумма: 1,000,000💰", delete_after=10)
+        await update.message.reply_text("❌ Максимальная сумма: 1,000,000💰")
         return
 
     success, message = db.add_robux(user_id, target, amount)
 
     if success:
-        await send_and_delete(update, context, message, delete_after=30)
+        await update.message.reply_text(message)
 
         try:
             user = db.get_user_by_name_or_id(target)
@@ -836,14 +780,14 @@ async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     else:
-        await send_and_delete(update, context, message, delete_after=10)
+        await update.message.reply_text(message)
 
 
 # ==================== КОМАНДА АДМИН ПАНЕЛИ ====================
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await send_and_delete(update, context, "⛔ Доступ запрещен!")
+        await update.message.reply_text("⛔ Доступ запрещен!")
         return
 
     stats = db.get_server_stats()
@@ -860,7 +804,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"/admin - это меню\n"
             f"/top - топ игроков")
 
-    await send_and_delete(update, context, text, delete_after=60)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== ИНФОРМАЦИЯ ====================
@@ -885,20 +829,19 @@ async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👑 **Создатель:** @Piskamer"
     )
 
-    keyboard = [[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]]
+    keyboard = [[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]] if is_private(update) else None
 
-    if is_group(update):
-        await send_and_delete(update, context, text)
-    else:
-        await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None,
+                                    parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== ТАП ====================
 
 async def handle_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
-        await send_and_delete(update, context,
-                              "❌ Тапать можно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        await update.message.reply_text(
+            "❌ Тапать можно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot"
+        )
         return
 
     user = update.effective_user
@@ -907,33 +850,33 @@ async def handle_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not can_tap:
         if current >= MAX_DAILY_TAPS:
-            await send_and_delete(update, context,
-                                  f"⏳ Ты исчерпал лимит на сегодня ({MAX_DAILY_TAPS} тапов)! Завтра продолжим 😊",
-                                  delete_after=5)
+            await update.message.reply_text(
+                f"⏳ Ты исчерпал лимит на сегодня ({MAX_DAILY_TAPS} тапов)! Завтра продолжим 😊"
+            )
         else:
-            await send_and_delete(update, context, "⏳ Подожди секунду между тапами!", delete_after=3)
+            await update.message.reply_text("⏳ Подожди секунду между тапами!")
         return
 
     tap_value, new_daily, remaining = db.update_tap(user.id)
 
     if tap_value > 0:
-        await send_and_delete(update, context,
-                              f"👆 +{tap_value:.2f}💰\n"
-                              f"📊 Сегодня: {new_daily}/{MAX_DAILY_TAPS}\n"
-                              f"⏳ Осталось: {remaining} тапов",
-                              delete_after=3
-                              )
+        await update.message.reply_text(
+            f"✅ +{tap_value:.2f}💰\n"
+            f"📊 Сегодня: {new_daily}/{MAX_DAILY_TAPS}\n"
+            f"⏳ Осталось: {remaining} тапов"
+        )
         await show_main_menu(update, context)
     else:
-        await send_and_delete(update, context, "❌ Ошибка при тапе", delete_after=3)
+        await update.message.reply_text("❌ Ошибка при тапе")
 
 
 # ==================== МАГАЗИН ====================
 
 async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
-        await send_and_delete(update, context,
-                              "❌ Магазин доступен только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        await update.message.reply_text(
+            "❌ Магазин доступен только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot"
+        )
         return
 
     user = update.effective_user
@@ -958,7 +901,7 @@ async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
     ]
 
-    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard), delete_after=60)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== КАЗИНО ====================
@@ -985,7 +928,7 @@ async def show_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
     ]
 
-    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard), delete_after=60)
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
 async def casino_choose_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1006,7 +949,7 @@ async def casino_choose_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("◀ Отмена", callback_data='casino_cancel')]]
         context.user_data['casino_mode'] = 'waiting_bet'
 
-        await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     else:
         bet = int(data.split('_')[1])
 
@@ -1036,7 +979,7 @@ async def casino_choose_side(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("◀ Назад", callback_data='casino_back')]
     ]
 
-    await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
 async def casino_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1066,7 +1009,7 @@ async def casino_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("◀ В меню", callback_data='back_to_menu')]
     ]
 
-    await edit_and_delete(query, context, result, InlineKeyboardMarkup(keyboard), delete_after=30)
+    await query.edit_message_text(result, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
     context.user_data.pop('casino_bet', None)
     context.user_data.pop('casino_mode', None)
@@ -1113,11 +1056,11 @@ async def casino_handle_message(update: Update, context: ContextTypes.DEFAULT_TY
         robux = user_data['robux'] if user_data else 0
 
         if bet < CASINO_MIN_BET or bet > CASINO_MAX_BET:
-            await send_and_delete(update, context, f"❌ От {CASINO_MIN_BET} до {CASINO_MAX_BET}💰!", delete_after=5)
+            await update.message.reply_text(f"❌ От {CASINO_MIN_BET} до {CASINO_MAX_BET}💰!")
             return
 
         if bet > robux:
-            await send_and_delete(update, context, f"❌ У тебя только {robux:.2f}💰!", delete_after=5)
+            await update.message.reply_text(f"❌ У тебя только {robux:.2f}💰!")
             return
 
         context.user_data['casino_bet'] = bet
@@ -1133,10 +1076,10 @@ async def casino_handle_message(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("◀ Отмена", callback_data='casino_cancel')]
         ]
 
-        await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
     except ValueError:
-        await send_and_delete(update, context, "❌ Введи число!", delete_after=3)
+        await update.message.reply_text("❌ Введи число!")
 
 
 # ==================== ДУЭЛИ ====================
@@ -1191,7 +1134,7 @@ async def show_duels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard.append([InlineKeyboardButton("◀ Назад в меню", callback_data='back_to_menu')])
 
-    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
 async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1200,13 +1143,13 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
 
     if len(context.args) != 2:
-        await send_and_delete(update, context,
-                              "❌ **Неправильный формат!**\n\n"
-                              "Используй: `/duel @username сумма`\n"
-                              "Или: `/duel ID сумма`\n\n"
-                              "Пример: `/duel @durov 100`",
-                              delete_after=20
-                              )
+        await update.message.reply_text(
+            "❌ **Неправильный формат!**\n\n"
+            "Используй: `/duel @username сумма`\n"
+            "Или: `/duel ID сумма`\n\n"
+            "Пример: `/duel @durov 100`",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     try:
@@ -1214,13 +1157,12 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bet = int(context.args[1])
 
         if bet < DUEL_BET_MIN or bet > DUEL_BET_MAX:
-            await send_and_delete(update, context, f"❌ Ставка должна быть от {DUEL_BET_MIN} до {DUEL_BET_MAX}💰",
-                                  delete_after=10)
+            await update.message.reply_text(f"❌ Ставка должна быть от {DUEL_BET_MIN} до {DUEL_BET_MAX}💰")
             return
 
         challenger = db.get_user(user.id)
         if not challenger or challenger['robux'] < bet:
-            await send_and_delete(update, context, f"❌ У тебя недостаточно робуксов! Нужно {bet}💰", delete_after=10)
+            await update.message.reply_text(f"❌ У тебя недостаточно робуксов! Нужно {bet}💰")
             return
 
         opponent = None
@@ -1257,29 +1199,29 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         if not opponent:
-            await send_and_delete(update, context,
-                                  "❌ **Противник не найден!**\n\n"
-                                  "Попроси противника написать /start в боте",
-                                  delete_after=15
-                                  )
+            await update.message.reply_text(
+                "❌ **Противник не найден!**\n\n"
+                "Попроси противника написать /start в боте",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
 
         opponent_id = opponent['user_id']
 
         if user.id == opponent_id:
-            await send_and_delete(update, context, "❌ Нельзя вызвать самого себя!", delete_after=10)
+            await update.message.reply_text("❌ Нельзя вызвать самого себя!")
             return
 
         if opponent['robux'] < bet:
-            await send_and_delete(update, context, "❌ У противника недостаточно робуксов!", delete_after=10)
+            await update.message.reply_text("❌ У противника недостаточно робуксов!")
             return
 
         if db.get_pending_duel(user.id):
-            await send_and_delete(update, context, "❌ У тебя уже есть активная дуэль!", delete_after=10)
+            await update.message.reply_text("❌ У тебя уже есть активная дуэль!")
             return
 
         if db.get_pending_duel(opponent_id):
-            await send_and_delete(update, context, "❌ У противника уже есть активная дуэль!", delete_after=10)
+            await update.message.reply_text("❌ У противника уже есть активная дуэль!")
             return
 
         success, msg = db.create_duel(user.id, opponent_id, bet, chat.id)
@@ -1289,14 +1231,14 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             duel_id = duel['duel_id'] if duel else 0
 
             opponent_name = opponent['first_name'] or opponent['username'] or str(opponent_id)
-            await send_and_delete(update, context,
-                                  f"✅ **Вызов отправлен!**\n\n"
-                                  f"👤 Противник: {opponent_name}\n"
-                                  f"💰 Ставка: {bet}💰\n"
-                                  f"📍 Найден в: {found_by}\n\n"
-                                  f"⏳ Ожидаем ответа...",
-                                  delete_after=20
-                                  )
+            await update.message.reply_text(
+                f"✅ **Вызов отправлен!**\n\n"
+                f"👤 Противник: {opponent_name}\n"
+                f"💰 Ставка: {bet}💰\n"
+                f"📍 Найден в: {found_by}\n\n"
+                f"⏳ Ожидаем ответа...",
+                parse_mode=ParseMode.MARKDOWN
+            )
 
             keyboard = [[
                 InlineKeyboardButton("✅ ПРИНЯТЬ ДУЭЛЬ", callback_data=f'accept_duel_{duel_id}'),
@@ -1323,20 +1265,20 @@ async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         mention = opponent_name
 
-                    await send_and_delete(update, context,
-                                          f"⚠️ Не удалось отправить личное сообщение.\n"
-                                          f"{mention}, **прими вызов здесь:**",
-                                          InlineKeyboardMarkup(keyboard),
-                                          delete_after=30
-                                          )
+                    await update.message.reply_text(
+                        f"⚠️ Не удалось отправить личное сообщение.\n"
+                        f"{mention}, **прими вызов здесь:**",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
         else:
-            await send_and_delete(update, context, f"❌ {msg}", delete_after=10)
+            await update.message.reply_text(f"❌ {msg}")
 
     except ValueError:
-        await send_and_delete(update, context, "❌ Сумма должна быть числом!", delete_after=10)
+        await update.message.reply_text("❌ Сумма должна быть числом!")
     except Exception as e:
         logger.error(f"Ошибка в duel_command: {e}")
-        await send_and_delete(update, context, f"❌ Произошла ошибка", delete_after=10)
+        await update.message.reply_text("❌ Произошла ошибка")
 
 
 async def accept_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1348,23 +1290,23 @@ async def accept_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     duel = db.get_duel_by_id(duel_id)
     if not duel:
-        await edit_and_delete(query, context, "❌ Дуэль не найдена или истекла", delete_after=10)
+        await query.edit_message_text("❌ Дуэль не найдена или истекла")
         return
 
     if user.id != duel['opponent_id']:
-        await edit_and_delete(query, context, "⛔ Это не твоя дуэль!", delete_after=10)
+        await query.edit_message_text("⛔ Это не твоя дуэль!")
         return
 
     challenger = db.get_user(duel['challenger_id'])
     opponent = db.get_user(duel['opponent_id'])
 
     if not challenger or challenger['robux'] < duel['bet_amount']:
-        await edit_and_delete(query, context, "❌ У противника недостаточно робуксов! Дуэль отменена.", delete_after=10)
+        await query.edit_message_text("❌ У противника недостаточно робуксов! Дуэль отменена.")
         db.cancel_duel(duel_id)
         return
 
     if not opponent or opponent['robux'] < duel['bet_amount']:
-        await edit_and_delete(query, context, "❌ У тебя недостаточно робуксов! Дуэль отменена.", delete_after=10)
+        await query.edit_message_text("❌ У тебя недостаточно робуксов! Дуэль отменена.")
         db.cancel_duel(duel_id)
         return
 
@@ -1388,7 +1330,7 @@ async def accept_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        f"💔 **Проигравший:** {loser_name}\n"
                        f"💰 **Выигрыш:** {bet}💰")
 
-        await edit_and_delete(query, context, result_text, delete_after=30)
+        await query.edit_message_text(result_text, parse_mode=ParseMode.MARKDOWN)
 
         try:
             await context.bot.send_message(winner_id, f"🎉 Ты победил в дуэли и выиграл {bet}💰!")
@@ -1396,7 +1338,7 @@ async def accept_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
     else:
-        await edit_and_delete(query, context, "❌ Ошибка при проведении дуэли", delete_after=10)
+        await query.edit_message_text("❌ Ошибка при проведении дуэли")
 
 
 async def reject_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1408,15 +1350,15 @@ async def reject_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     duel = db.get_duel_by_id(duel_id)
     if not duel:
-        await edit_and_delete(query, context, "❌ Дуэль не найдена", delete_after=10)
+        await query.edit_message_text("❌ Дуэль не найдена")
         return
 
     if user.id != duel['opponent_id']:
-        await edit_and_delete(query, context, "⛔ Это не твоя дуэль!", delete_after=10)
+        await query.edit_message_text("⛔ Это не твоя дуэль!")
         return
 
     db.cancel_duel(duel_id)
-    await edit_and_delete(query, context, "❌ Ты отказался от дуэли", delete_after=10)
+    await query.edit_message_text("❌ Ты отказался от дуэли")
 
     try:
         await context.bot.send_message(duel['challenger_id'], "😢 Противник отказался от дуэли!")
@@ -1433,15 +1375,15 @@ async def cancel_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     duel = db.get_duel_by_id(duel_id)
     if not duel:
-        await edit_and_delete(query, context, "❌ Дуэль не найдена", delete_after=10)
+        await query.edit_message_text("❌ Дуэль не найдена")
         return
 
     if user.id != duel['challenger_id']:
-        await edit_and_delete(query, context, "⛔ Ты не можешь отменить эту дуэль!", delete_after=10)
+        await query.edit_message_text("⛔ Ты не можешь отменить эту дуэль!")
         return
 
     db.cancel_duel(duel_id)
-    await edit_and_delete(query, context, "✅ Дуэль отменена", delete_after=10)
+    await query.edit_message_text("✅ Дуэль отменена")
 
     try:
         await context.bot.send_message(duel['opponent_id'], "❌ Противник отменил дуэль!")
@@ -1453,8 +1395,9 @@ async def cancel_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_private(update):
-        await send_and_delete(update, context,
-                              "❌ Статистика доступна только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        await update.message.reply_text(
+            "❌ Статистика доступна только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot"
+        )
         return
 
     user = update.effective_user
@@ -1482,7 +1425,7 @@ async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = "❌ Нет данных"
 
-    await send_and_delete(update, context, text, delete_after=60)
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== ПОКУПКИ ====================
@@ -1513,7 +1456,7 @@ async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
         ]
 
-        await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
     else:
         await query.answer(msg, show_alert=True)
 
@@ -1530,7 +1473,7 @@ async def auto_clicker_job(context: ContextTypes.DEFAULT_TYPE):
 
         db.conn.commit()
         if users:
-            logger.info(f"🔄 Автокликер: {len(users)} пользователей, +{sum(users)}💰")
+            logger.info(f"🔄 Автокликер: {len(users)} пользователей")
     except Exception as e:
         logger.error(f"❌ Ошибка автокликера: {e}")
 
@@ -1549,7 +1492,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 fake_update.message = query.message
                 await show_main_menu(fake_update, context)
             else:
-                await edit_and_delete(query, context, "❌ Это меню доступно только в личных сообщениях!")
+                await query.edit_message_text("❌ Это меню доступно только в личных сообщениях!")
 
         elif data == 'refresh_top':
             await query.answer()
