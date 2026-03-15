@@ -1,0 +1,1695 @@
+import logging
+import asyncio
+import sqlite3
+import random
+import sys
+import os
+import time
+import traceback
+from datetime import datetime, timedelta, date
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.constants import ParseMode
+from telegram.error import TelegramError, NetworkError, TimedOut
+
+# ==================== КОНФИГУРАЦИЯ ====================
+BOT_TOKEN = "8681184073:AAGdu67tjipTDSgZcu1sACtY0yDgg-RoXf4"
+ADMIN_ID = 7128369499  # Твой ID
+
+# НАСТРОЙКИ ТАПОВ
+TAP_COOLDOWN = 1  # 1 секунда между тапами
+TAP_BASE_VALUE = 0.1  # 0.1 робукса за тап
+MAX_DAILY_TAPS = 1000  # Максимум 1000 тапов в день
+CLICK_POWER_START = 1  # Сила клика (множитель: 1 = 0.1 руб)
+CLICK_POWER_PRICE = 100  # Цена улучшения (+1 к множителю)
+AUTO_CLICKER_PRICE = 500  # Цена автокликера
+
+# НАСТРОЙКИ ДУЭЛЕЙ
+DUEL_COOLDOWN = 60
+DUEL_BET_MIN = 10
+DUEL_BET_MAX = 10000
+
+# НАСТРОЙКИ КАЗИНО
+CASINO_MIN_BET = 5
+CASINO_MAX_BET = 5000
+CASINO_WIN_RATE = 30  # 30% шанс победы
+
+# Настройка автоудаления (в секундах)
+DELETE_GROUP_MESSAGES = 30  # Сообщения в группах удаляются через 30 секунд
+DELETE_PRIVATE_MESSAGES = 0  # 0 = не удалять в личке
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# ==================== БАЗА ДАННЫХ ====================
+class Database:
+    def __init__(self, db_name="roblox_clicker.db"):
+        self.db_name = db_name
+        self.conn = None
+        self.cursor = None
+        self.connect()
+        self.create_tables()
+        logger.info("✅ База данных подключена")
+
+    def connect(self):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=20)
+                self.conn.row_factory = sqlite3.Row
+                self.cursor = self.conn.cursor()
+                return
+            except Exception as e:
+                logger.error(f"❌ Ошибка подключения к БД (попытка {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(1)
+                else:
+                    raise
+
+    def execute(self, query, params=None):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if params:
+                    self.cursor.execute(query, params)
+                else:
+                    self.cursor.execute(query)
+                self.conn.commit()
+                return True
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < max_retries - 1:
+                    time.sleep(0.1 * (attempt + 1))
+                    continue
+                logger.error(f"❌ Ошибка БД: {e}")
+                return False
+            except Exception as e:
+                logger.error(f"❌ Ошибка БД: {e}")
+                return False
+        return False
+
+    def create_tables(self):
+        # Таблица users с новыми полями
+        self.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                robux REAL DEFAULT 0,  -- Изменено на REAL для дробных значений
+                taps INTEGER DEFAULT 0,
+                daily_taps INTEGER DEFAULT 0,
+                last_tap_date DATE,
+                click_power INTEGER DEFAULT 1,
+                auto_clickers INTEGER DEFAULT 0,
+                last_tap_time TIMESTAMP,
+                joined_date TIMESTAMP,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                last_duel_time TIMESTAMP,
+                casino_wins INTEGER DEFAULT 0,
+                casino_losses INTEGER DEFAULT 0
+            )
+        ''')
+
+        self.execute('''
+            CREATE TABLE IF NOT EXISTS admin_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                action TEXT,
+                target_user_id INTEGER,
+                amount REAL,
+                timestamp TIMESTAMP
+            )
+        ''')
+
+        self.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                timestamp TIMESTAMP
+            )
+        ''')
+
+        self.execute('''
+            CREATE TABLE IF NOT EXISTS active_duels (
+                duel_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                challenger_id INTEGER,
+                opponent_id INTEGER,
+                bet_amount REAL,
+                status TEXT,
+                created_at TIMESTAMP,
+                expires_at TIMESTAMP,
+                chat_id INTEGER
+            )
+        ''')
+
+        # Добавляем chat_id если его нет
+        try:
+            self.cursor.execute("PRAGMA table_info(active_duels)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+            if 'chat_id' not in columns:
+                self.cursor.execute("ALTER TABLE active_duels ADD COLUMN chat_id INTEGER")
+                self.conn.commit()
+                logger.info("✅ Добавлена колонка chat_id в таблицу active_duels")
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка при добавлении chat_id: {e}")
+
+        # Проверка и добавление новых колонок
+        self.cursor.execute("PRAGMA table_info(users)")
+        existing_columns = [col[1] for col in self.cursor.fetchall()]
+
+        columns_to_add = {
+            'wins': 'INTEGER DEFAULT 0',
+            'losses': 'INTEGER DEFAULT 0',
+            'last_duel_time': 'TIMESTAMP',
+            'casino_wins': 'INTEGER DEFAULT 0',
+            'casino_losses': 'INTEGER DEFAULT 0',
+            'daily_taps': 'INTEGER DEFAULT 0',
+            'last_tap_date': 'DATE'
+        }
+
+        for col_name, col_type in columns_to_add.items():
+            if col_name not in existing_columns:
+                try:
+                    self.cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+                    self.conn.commit()
+                    logger.info(f"✅ Добавлена колонка {col_name}")
+                except Exception as e:
+                    logger.error(f"⚠️ Ошибка при добавлении {col_name}: {e}")
+
+        self.conn.commit()
+
+    def get_user(self, user_id):
+        try:
+            self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = self.cursor.fetchone()
+            if row:
+                user = dict(row)
+                # Проверяем и сбрасываем daily_taps если новый день
+                today = date.today().isoformat()
+                if user.get('last_tap_date') != today:
+                    self.reset_daily_taps(user_id)
+                    user['daily_taps'] = 0
+                    user['last_tap_date'] = today
+                return user
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_user: {e}")
+            return None
+
+    def reset_daily_taps(self, user_id):
+        """Сброс счетчика тапов на новый день"""
+        try:
+            today = date.today().isoformat()
+            self.cursor.execute('''
+                UPDATE users 
+                SET daily_taps = 0, last_tap_date = ? 
+                WHERE user_id = ?
+            ''', (today, user_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка reset_daily_taps: {e}")
+
+    def get_user_by_username(self, username):
+        try:
+            username = username.replace('@', '').lower()
+            self.cursor.execute("SELECT * FROM users WHERE LOWER(username) = ?", (username,))
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_user_by_username: {e}")
+            return None
+
+    def get_user_by_name_or_id(self, identifier):
+        try:
+            try:
+                user_id = int(identifier)
+                user = self.get_user(user_id)
+                if user:
+                    return user
+            except ValueError:
+                pass
+
+            username = identifier.replace('@', '').lower()
+            user = self.get_user_by_username(username)
+            if user:
+                return user
+
+            return None
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_user_by_name_or_id: {e}")
+            return None
+
+    def add_user(self, user_id, username, first_name):
+        try:
+            now = datetime.now().isoformat()
+            today = date.today().isoformat()
+            user = self.get_user(user_id)
+            if user:
+                if user['username'] != username:
+                    self.cursor.execute("UPDATE users SET username = ? WHERE user_id = ?",
+                                        (username, user_id))
+                    self.conn.commit()
+                return False
+
+            self.cursor.execute('''
+                INSERT INTO users (
+                    user_id, username, first_name, robux, taps, daily_taps, last_tap_date,
+                    click_power, auto_clickers, last_tap_time, joined_date, 
+                    wins, losses, last_duel_time, casino_wins, casino_losses
+                ) VALUES (?, ?, ?, 0, 0, 0, ?, 1, 0, ?, ?, 0, 0, ?, 0, 0)
+            ''', (user_id, username, first_name, today, now, now, now))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Ошибка add_user: {e}")
+            return False
+
+    def update_tap(self, user_id):
+        """Обновление данных при тапе"""
+        try:
+            user = self.get_user(user_id)
+            if not user:
+                return 0, 0, 0
+
+            # Проверяем лимит тапов
+            today = date.today().isoformat()
+            if user['last_tap_date'] != today:
+                self.reset_daily_taps(user_id)
+                daily_taps = 0
+            else:
+                daily_taps = user['daily_taps']
+
+            if daily_taps >= MAX_DAILY_TAPS:
+                return 0, daily_taps, MAX_DAILY_TAPS
+
+            click_power = user['click_power']
+            tap_value = TAP_BASE_VALUE * click_power
+            new_robux = round(user['robux'] + tap_value, 2)
+            new_taps = user['taps'] + 1
+            new_daily_taps = daily_taps + 1
+
+            self.cursor.execute('''
+                UPDATE users 
+                SET robux = ?, taps = ?, daily_taps = ?, last_tap_time = ?, last_tap_date = ?
+                WHERE user_id = ?
+            ''', (new_robux, new_taps, new_daily_taps, datetime.now().isoformat(), today, user_id))
+            self.conn.commit()
+
+            logger.info(f"✅ Тап: user={user_id}, +{tap_value:.2f}💰 (день {new_daily_taps}/{MAX_DAILY_TAPS})")
+            return tap_value, new_daily_taps, MAX_DAILY_TAPS - new_daily_taps
+        except Exception as e:
+            logger.error(f"❌ Ошибка update_tap: {e}")
+            return 0, 0, 0
+
+    def can_tap(self, user_id):
+        """Проверка, можно ли тапать"""
+        try:
+            user = self.get_user(user_id)
+            if not user:
+                return True, 0, 0
+
+            # Проверка кулдауна
+            if user.get('last_tap_time'):
+                last_tap = datetime.fromisoformat(user['last_tap_time'])
+                if datetime.now() - last_tap < timedelta(seconds=TAP_COOLDOWN):
+                    return False, 0, 0
+
+            # Проверка дневного лимита
+            today = date.today().isoformat()
+            if user['last_tap_date'] != today:
+                return True, 0, MAX_DAILY_TAPS
+
+            remaining = MAX_DAILY_TAPS - user['daily_taps']
+            return remaining > 0, user['daily_taps'], remaining
+        except Exception as e:
+            logger.error(f"❌ Ошибка can_tap: {e}")
+            return True, 0, MAX_DAILY_TAPS
+
+    def buy_item(self, user_id, item_type):
+        try:
+            user = self.get_user(user_id)
+            if not user:
+                return False, "Пользователь не найден"
+
+            robux = user['robux']
+
+            if item_type == "click_power" and robux >= CLICK_POWER_PRICE:
+                self.cursor.execute('''
+                    UPDATE users 
+                    SET click_power = click_power + 1, robux = robux - ? 
+                    WHERE user_id = ?
+                ''', (CLICK_POWER_PRICE, user_id))
+                self.conn.commit()
+                new_power = user['click_power'] + 1
+                return True, f"⚡ Усиление клика куплено! Теперь {new_power}x (0.{new_power}💰 за тап)"
+            elif item_type == "auto_clicker" and robux >= AUTO_CLICKER_PRICE:
+                self.cursor.execute('''
+                    UPDATE users 
+                    SET auto_clickers = auto_clickers + 1, robux = robux - ? 
+                    WHERE user_id = ?
+                ''', (AUTO_CLICKER_PRICE, user_id))
+                self.conn.commit()
+                return True, "🤖 Автокликер куплен!"
+            elif robux < CLICK_POWER_PRICE and item_type == "click_power":
+                return False, f"❌ Нужно {CLICK_POWER_PRICE}💰, у тебя {robux:.2f}💰"
+            elif robux < AUTO_CLICKER_PRICE and item_type == "auto_clicker":
+                return False, f"❌ Нужно {AUTO_CLICKER_PRICE}💰, у тебя {robux:.2f}💰"
+            return False, "❌ Ошибка покупки"
+        except Exception as e:
+            logger.error(f"❌ Ошибка buy_item: {e}")
+            return False, f"❌ Ошибка: {e}"
+
+    def casino_play(self, user_id, bet_amount, choice):
+        """Игра в казино с 30% шансом победы"""
+        try:
+            user = self.get_user(user_id)
+            if not user or user['robux'] < bet_amount:
+                return False, 0, "Недостаточно средств"
+
+            # 30% шанс победы
+            win = random.randint(1, 100) <= CASINO_WIN_RATE
+
+            if win:
+                winnings = bet_amount * 2  # x2 при выигрыше
+                self.cursor.execute('''
+                    UPDATE users 
+                    SET robux = robux + ?, casino_wins = casino_wins + 1 
+                    WHERE user_id = ?
+                ''', (bet_amount, user_id))  # +bet_amount потому что ставка уже была списана?
+                # Правильнее: robux = robux + bet_amount (возврат ставки + выигрыш)
+                # Но обычно в казино: поставил 10, выиграл 20 (чистый выигрыш 10)
+                result_text = "ВЫИГРАЛ"
+            else:
+                self.cursor.execute('''
+                    UPDATE users 
+                    SET robux = robux - ?, casino_losses = casino_losses + 1 
+                    WHERE user_id = ?
+                ''', (bet_amount, user_id))
+                result_text = "ПРОИГРАЛ"
+
+            self.conn.commit()
+            return win, bet_amount, result_text
+        except Exception as e:
+            logger.error(f"❌ Ошибка casino_play: {e}")
+            return False, 0, f"Ошибка: {e}"
+
+    def create_duel(self, challenger_id, opponent_id, bet_amount, chat_id=None):
+        try:
+            self.cursor.execute('''
+                SELECT * FROM active_duels 
+                WHERE ((challenger_id = ? AND opponent_id = ?) OR (challenger_id = ? AND opponent_id = ?)) 
+                AND status = 'pending'
+            ''', (challenger_id, opponent_id, opponent_id, challenger_id))
+
+            if self.cursor.fetchone():
+                return False, "Уже есть активная дуэль между вами"
+
+            now = datetime.now()
+            expires = now + timedelta(minutes=2)
+
+            self.cursor.execute('''
+                INSERT INTO active_duels (challenger_id, opponent_id, bet_amount, status, created_at, expires_at, chat_id)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?)
+            ''', (challenger_id, opponent_id, bet_amount, now.isoformat(), expires.isoformat(), chat_id))
+
+            self.conn.commit()
+            return True, "Дуэль создана"
+        except Exception as e:
+            logger.error(f"❌ Ошибка create_duel: {e}")
+            return False, f"Ошибка: {e}"
+
+    def get_pending_duel(self, user_id):
+        try:
+            self.cursor.execute('''
+                SELECT * FROM active_duels 
+                WHERE (challenger_id = ? OR opponent_id = ?) 
+                AND status = 'pending'
+                AND datetime(expires_at) > datetime('now')
+                ORDER BY created_at DESC LIMIT 1
+            ''', (user_id, user_id))
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_pending_duel: {e}")
+            return None
+
+    def get_duel_by_id(self, duel_id):
+        try:
+            self.cursor.execute('SELECT * FROM active_duels WHERE duel_id = ?', (duel_id,))
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_duel_by_id: {e}")
+            return None
+
+    def cancel_duel(self, duel_id):
+        try:
+            self.cursor.execute('DELETE FROM active_duels WHERE duel_id = ? AND status = "pending"', (duel_id,))
+            self.conn.commit()
+            return self.cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"❌ Ошибка cancel_duel: {e}")
+            return False
+
+    def resolve_duel(self, duel_id, winner_id, loser_id):
+        try:
+            duel = self.get_duel_by_id(duel_id)
+            if not duel:
+                return False, 0
+
+            bet_amount = duel['bet_amount']
+
+            self.cursor.execute('''
+                UPDATE users 
+                SET robux = robux + ?, wins = wins + 1, last_duel_time = ? 
+                WHERE user_id = ?
+            ''', (bet_amount, datetime.now().isoformat(), winner_id))
+
+            self.cursor.execute('''
+                UPDATE users 
+                SET robux = robux - ?, losses = losses + 1, last_duel_time = ? 
+                WHERE user_id = ?
+            ''', (bet_amount, datetime.now().isoformat(), loser_id))
+
+            self.cursor.execute('DELETE FROM active_duels WHERE duel_id = ?', (duel_id,))
+
+            self.conn.commit()
+            return True, bet_amount
+        except Exception as e:
+            logger.error(f"❌ Ошибка resolve_duel: {e}")
+            return False, 0
+
+    def add_robux(self, admin_id, target, amount):
+        try:
+            user = self.get_user_by_name_or_id(target)
+            if not user:
+                return False, f"❌ Пользователь {target} не найден в базе"
+
+            target_id = user['user_id']
+            current_robux = user['robux']
+            new_robux = current_robux + amount
+
+            self.cursor.execute('''
+                UPDATE users 
+                SET robux = robux + ? 
+                WHERE user_id = ?
+            ''', (amount, target_id))
+
+            self.cursor.execute('''
+                INSERT INTO admin_logs (admin_id, action, target_user_id, amount, timestamp)
+                VALUES (?, 'add_robux', ?, ?, ?)
+            ''', (admin_id, target_id, amount, datetime.now().isoformat()))
+
+            self.conn.commit()
+
+            name = user['first_name'] or user['username'] or str(target_id)
+            logger.info(f"✅ Админ {admin_id} выдал {amount}💰 пользователю {target_id}")
+
+            return True, (f"✅ Выдано {amount}💰 пользователю {name}\n"
+                          f"💰 Старый баланс: {current_robux:.2f}💰\n"
+                          f"💰 Новый баланс: {new_robux:.2f}💰")
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка add_robux: {e}")
+            return False, f"❌ Ошибка: {e}"
+
+    def get_top_users(self, limit=10):
+        try:
+            self.cursor.execute('''
+                SELECT user_id, first_name, username, robux, taps, click_power, 
+                       wins, losses, casino_wins, casino_losses
+                FROM users 
+                ORDER BY robux DESC 
+                LIMIT ?
+            ''', (limit,))
+
+            users = []
+            for row in self.cursor.fetchall():
+                user = dict(row)
+                total_duels = user['wins'] + user['losses']
+                user['win_rate'] = round((user['wins'] / total_duels * 100) if total_duels > 0 else 0, 1)
+                users.append(user)
+
+            return users
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_top_users: {e}")
+            return []
+
+    def get_server_stats(self):
+        try:
+            stats = {}
+
+            self.cursor.execute("SELECT COUNT(*) as count FROM users")
+            stats['total_users'] = self.cursor.fetchone()['count']
+
+            self.cursor.execute("SELECT SUM(robux) as total FROM users")
+            stats['total_robux'] = round(self.cursor.fetchone()['total'] or 0, 2)
+
+            self.cursor.execute("SELECT SUM(taps) as total FROM users")
+            stats['total_taps'] = int(self.cursor.fetchone()['total'] or 0)
+
+            self.cursor.execute("SELECT AVG(click_power) as avg FROM users")
+            stats['avg_click_power'] = round(self.cursor.fetchone()['avg'] or 1, 1)
+
+            self.cursor.execute("SELECT SUM(auto_clickers) as total FROM users")
+            stats['total_auto_clickers'] = int(self.cursor.fetchone()['total'] or 0)
+
+            return stats
+        except Exception as e:
+            logger.error(f"❌ Ошибка get_server_stats: {e}")
+            return {
+                'total_users': 0,
+                'total_robux': 0,
+                'total_taps': 0,
+                'avg_click_power': 0,
+                'total_auto_clickers': 0
+            }
+
+
+# Инициализация БД
+db = Database()
+
+
+# ==================== ФУНКЦИИ АВТОУДАЛЕНИЯ ====================
+
+async def auto_delete(context: ContextTypes.DEFAULT_TYPE):
+    """Автоматическое удаление сообщений"""
+    job = context.job
+    try:
+        await context.bot.delete_message(chat_id=job.chat_id, message_id=job.data)
+        logger.info(f"🗑️ Удалено сообщение {job.data} в чате {job.chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Не удалось удалить сообщение: {e}")
+
+
+async def send_and_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None,
+                          delete_after=None):
+    """Отправить сообщение и запланировать удаление"""
+    chat_type = update.effective_chat.type
+
+    if delete_after is not None:
+        seconds = delete_after
+    elif chat_type in ['group', 'supergroup']:
+        seconds = DELETE_GROUP_MESSAGES
+    else:
+        seconds = DELETE_PRIVATE_MESSAGES
+
+    if update.callback_query:
+        message = await update.callback_query.message.reply_text(text, reply_markup=reply_markup,
+                                                                 parse_mode=ParseMode.MARKDOWN)
+    else:
+        message = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+    if seconds > 0:
+        context.job_queue.run_once(auto_delete, seconds, data=message.message_id, chat_id=message.chat_id)
+        logger.info(f"⏰ Сообщение {message.message_id} будет удалено через {seconds} сек")
+
+    return message
+
+
+async def edit_and_delete(query, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, delete_after=None):
+    """Изменить сообщение и запланировать удаление"""
+    chat_type = query.message.chat.type
+
+    if delete_after is not None:
+        seconds = delete_after
+    elif chat_type in ['group', 'supergroup']:
+        seconds = DELETE_GROUP_MESSAGES
+    else:
+        seconds = DELETE_PRIVATE_MESSAGES
+
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+    if seconds > 0:
+        context.job_queue.run_once(auto_delete, seconds, data=query.message.message_id, chat_id=query.message.chat_id)
+        logger.info(f"⏰ Сообщение {query.message.message_id} будет удалено через {seconds} сек")
+
+
+# ==================== КЛАВИАТУРЫ ====================
+
+def get_main_keyboard():
+    """Клавиатура для личных сообщений"""
+    keyboard = [
+        [KeyboardButton("👆 ТАПНУТЬ")],
+        [KeyboardButton("🏪 Магазин"), KeyboardButton("⚔️ Дуэли")],
+        [KeyboardButton("🎰 Казино"), KeyboardButton("📊 Статистика")],
+        [KeyboardButton("🏆 Топ игроков"), KeyboardButton("ℹ️ Информация")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def get_group_keyboard():
+    """Клавиатура для групповых чатов"""
+    keyboard = [
+        [KeyboardButton("⚔️ Дуэли"), KeyboardButton("🎰 Казино")],
+        [KeyboardButton("🏆 Топ игроков"), KeyboardButton("ℹ️ Информация")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+# ==================== ПРОВЕРКА ТИПА ЧАТА ====================
+
+def is_private(update: Update):
+    return update.effective_chat.type == "private"
+
+
+def is_group(update: Update):
+    return update.effective_chat.type in ["group", "supergroup"]
+
+
+# ==================== ГЛАВНОЕ МЕНЮ ====================
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private(update):
+        await send_and_delete(update, context,
+                              "❌ Это меню доступно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        return
+
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+
+    if user_data:
+        robux = user_data['robux']
+        taps = user_data['taps']
+        daily_taps = user_data['daily_taps']
+        click_power = user_data['click_power']
+        auto_clickers = user_data['auto_clickers']
+        wins = user_data['wins']
+        losses = user_data['losses']
+        casino_wins = user_data['casino_wins']
+        casino_losses = user_data['casino_losses']
+    else:
+        robux = taps = daily_taps = wins = losses = casino_wins = casino_losses = 0
+        click_power = 1
+        auto_clickers = 0
+
+    tap_value = TAP_BASE_VALUE * click_power
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    casino_rate = (casino_wins / (casino_wins + casino_losses) * 100) if (casino_wins + casino_losses) > 0 else 0
+    remaining_taps = MAX_DAILY_TAPS - daily_taps
+
+    text = (f"🎮 **ROBLOX CLICKER** 🎮\n\n"
+            f"👤 **{user.first_name}**\n"
+            f"💰 Робуксы: **{robux:.2f}**\n"
+            f"👆 Тапов сегодня: **{daily_taps}/{MAX_DAILY_TAPS}**\n"
+            f"⚡ Один тап: **{tap_value:.2f}💰** (x{click_power})\n"
+            f"🤖 Автокликеров: **{auto_clickers}**\n"
+            f"⚔️ Дуэли: {wins}W / {losses}L ({win_rate:.1f}%)\n"
+            f"🎰 Казино: {casino_wins}W / {casino_losses}L ({casino_rate:.1f}%)\n"
+            f"📊 Осталось тапов: {remaining_taps}")
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+        await update.callback_query.message.reply_text("Выбери действие:", reply_markup=get_main_keyboard())
+    else:
+        await update.message.reply_text(text, reply_markup=get_main_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+
+# ==================== КОМАНДА START ====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    is_new = db.add_user(user.id, user.username, user.first_name)
+
+    if is_new:
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"🎉 **НОВЫЙ ПОЛЬЗОВАТЕЛЬ!**\n\n"
+                f"👤 Имя: {user.first_name}\n"
+                f"📱 Username: @{user.username if user.username else 'нет'}\n"
+                f"🆔 ID: `{user.id}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            pass
+
+    if is_group(update):
+        await update.message.reply_text(
+            f"🎮 **Roblox Clicker Bot**\n\n"
+            f"Привет, {user.first_name}! В группе доступны только публичные функции:\n"
+            f"• ⚔️ Дуэли\n"
+            f"• 🎰 Казино (шанс {CASINO_WIN_RATE}%)\n"
+            f"• 🏆 Топ игроков\n\n"
+            f"Для тапов ({TAP_BASE_VALUE}💰/тап, макс {MAX_DAILY_TAPS} в день) и магазина напиши мне в личку: @roblox_clicker_bot",
+            reply_markup=get_group_keyboard(),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await show_main_menu(update, context)
+
+
+# ==================== ТОП ИГРОКОВ ====================
+
+async def show_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    top_users = db.get_top_users(10)
+
+    if not top_users:
+        text = "🏆 **ТОП ИГРОКОВ** 🏆\n\nПока нет игроков в базе данных"
+    else:
+        text = "🏆 **ТОП-10 ИГРОКОВ** 🏆\n\n"
+
+        for i, user in enumerate(top_users, 1):
+            name = user['first_name'] or user['username'] or f"Игрок {user['user_id']}"
+
+            if i == 1:
+                medal = "🥇"
+            elif i == 2:
+                medal = "🥈"
+            elif i == 3:
+                medal = "🥉"
+            else:
+                medal = f"{i}."
+
+            text += f"{medal} **{name}**\n"
+            text += f"   💰 **{user['robux']:.2f}** робуксов\n"
+            text += f"   👆 {user['taps']} тапов | ⚡ {user['click_power']}x\n"
+
+            if user['wins'] > 0 or user['losses'] > 0:
+                text += f"   ⚔️ {user['wins']}W-{user['losses']}L ({user['win_rate']}%)\n"
+
+            text += "\n"
+
+    keyboard = [[InlineKeyboardButton("🔄 Обновить", callback_data='refresh_top')]]
+
+    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+
+
+# ==================== КОМАНДА ВЫДАЧИ РОБУКСОВ ====================
+
+async def give_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id != ADMIN_ID:
+        await send_and_delete(update, context, "⛔ Эта команда только для администратора!")
+        return
+
+    if len(context.args) < 2:
+        await send_and_delete(update, context,
+                              "❌ Неправильный формат!\n"
+                              "Используй: `/give @username сумма`\n"
+                              "Или: `/give ID сумма`\n\n"
+                              "Примеры:\n"
+                              "`/give @durov 100`\n"
+                              "`/give 123456789 500`",
+                              delete_after=30
+                              )
+        return
+
+    target = context.args[0]
+    try:
+        amount = float(context.args[1])
+    except ValueError:
+        await send_and_delete(update, context, "❌ Сумма должна быть числом!", delete_after=10)
+        return
+
+    if amount <= 0:
+        await send_and_delete(update, context, "❌ Сумма должна быть положительной!", delete_after=10)
+        return
+
+    if amount > 1000000:
+        await send_and_delete(update, context, "❌ Максимальная сумма: 1,000,000💰", delete_after=10)
+        return
+
+    success, message = db.add_robux(user_id, target, amount)
+
+    if success:
+        await send_and_delete(update, context, message, delete_after=30)
+
+        try:
+            user = db.get_user_by_name_or_id(target)
+            if user:
+                await context.bot.send_message(
+                    user['user_id'],
+                    f"💰 Админ выдал тебе {amount} робуксов!"
+                )
+        except:
+            pass
+    else:
+        await send_and_delete(update, context, message, delete_after=10)
+
+
+# ==================== КОМАНДА АДМИН ПАНЕЛИ ====================
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await send_and_delete(update, context, "⛔ Доступ запрещен!")
+        return
+
+    stats = db.get_server_stats()
+
+    text = (f"👑 **АДМИН ПАНЕЛЬ** 👑\n\n"
+            f"📊 **Статистика:**\n"
+            f"👥 Пользователей: {stats['total_users']}\n"
+            f"💰 Всего робуксов: {stats['total_robux']:.2f}\n"
+            f"👆 Всего тапов: {stats['total_taps']}\n"
+            f"⚡ Средняя сила: {stats['avg_click_power']}x\n"
+            f"🤖 Автокликеров: {stats['total_auto_clickers']}\n\n"
+            f"📝 **Команды:**\n"
+            f"/give @user сумма - выдать робуксы\n"
+            f"/admin - это меню\n"
+            f"/top - топ игроков")
+
+    await send_and_delete(update, context, text, delete_after=60)
+
+
+# ==================== ИНФОРМАЦИЯ ====================
+
+async def show_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "ℹ️ **ИНФОРМАЦИЯ**\n\n"
+        "🎮 **Roblox Clicker Bot**\n\n"
+        "📌 **Что умеет:**\n"
+        f"• 👆 Тапать - {TAP_BASE_VALUE}💰/тап (макс {MAX_DAILY_TAPS} в день)\n"
+        "• 🏪 Магазин - улучшения (только в личке)\n"
+        "• ⚔️ Дуэли - сражаться (везде)\n"
+        f"• 🎰 Казино - {CASINO_WIN_RATE}% шанс (везде)\n"
+        "• 📊 Статистика - прогресс (только в личке)\n"
+        "• 🏆 Топ - лидеры (везде)\n\n"
+        "📝 **Команды:**\n"
+        "/start - главное меню\n"
+        "/duel @user сумма - вызвать на дуэль\n"
+        "/top - топ игроков\n"
+        "/give @user сумма - выдача (админ)\n"
+        "/admin - админ панель\n\n"
+        "👑 **Создатель:** @Piskamer"
+    )
+
+    keyboard = [[InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]]
+
+    if is_group(update):
+        await send_and_delete(update, context, text)
+    else:
+        await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+
+
+# ==================== ТАП ====================
+
+async def handle_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private(update):
+        await send_and_delete(update, context,
+                              "❌ Тапать можно только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        return
+
+    user = update.effective_user
+
+    can_tap, current, remaining = db.can_tap(user.id)
+
+    if not can_tap:
+        if current >= MAX_DAILY_TAPS:
+            await send_and_delete(update, context,
+                                  f"⏳ Ты исчерпал лимит на сегодня ({MAX_DAILY_TAPS} тапов)! Завтра продолжим 😊",
+                                  delete_after=5)
+        else:
+            await send_and_delete(update, context, "⏳ Подожди секунду между тапами!", delete_after=3)
+        return
+
+    tap_value, new_daily, remaining = db.update_tap(user.id)
+
+    if tap_value > 0:
+        await send_and_delete(update, context,
+                              f"👆 +{tap_value:.2f}💰\n"
+                              f"📊 Сегодня: {new_daily}/{MAX_DAILY_TAPS}\n"
+                              f"⏳ Осталось: {remaining} тапов",
+                              delete_after=3
+                              )
+        await show_main_menu(update, context)
+    else:
+        await send_and_delete(update, context, "❌ Ошибка при тапе", delete_after=3)
+
+
+# ==================== МАГАЗИН ====================
+
+async def show_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private(update):
+        await send_and_delete(update, context,
+                              "❌ Магазин доступен только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        return
+
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+    robux = user_data['robux'] if user_data else 0
+    click_power = user_data['click_power'] if user_data else 1
+    tap_value = TAP_BASE_VALUE * click_power
+
+    text = (f"🏪 **МАГАЗИН**\n\n"
+            f"💰 Твой баланс: **{robux:.2f}**\n"
+            f"⚡ Твой тап: **{tap_value:.2f}💰** (x{click_power})\n\n"
+            f"⚡ **Усиление клика**\n"
+            f"➕ +{TAP_BASE_VALUE}💰 за тап (x{click_power + 1})\n"
+            f"💵 Цена: {CLICK_POWER_PRICE}💰\n\n"
+            f"🤖 **Автокликер**\n"
+            f"⏰ +1💰/10сек\n"
+            f"💵 Цена: {AUTO_CLICKER_PRICE}💰")
+
+    keyboard = [
+        [InlineKeyboardButton(f"⚡ Купить (+{TAP_BASE_VALUE}💰)", callback_data='buy_click_power')],
+        [InlineKeyboardButton("🤖 Купить автокликер", callback_data='buy_auto_clicker')],
+        [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
+    ]
+
+    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard), delete_after=60)
+
+
+# ==================== КАЗИНО ====================
+
+async def show_casino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+    robux = user_data['robux'] if user_data else 0
+
+    text = (f"🎰 **КАЗИНО** 🎰\n\n"
+            f"💰 Баланс: **{robux:.2f}**\n"
+            f"🎲 Шанс победы: **{CASINO_WIN_RATE}%**\n"
+            f"💵 Выигрыш: **x2**\n\n"
+            f"Выбери ставку:")
+
+    keyboard = [
+        [InlineKeyboardButton("10💰", callback_data='casino_10'),
+         InlineKeyboardButton("50💰", callback_data='casino_50'),
+         InlineKeyboardButton("100💰", callback_data='casino_100')],
+        [InlineKeyboardButton("500💰", callback_data='casino_500'),
+         InlineKeyboardButton("1000💰", callback_data='casino_1000'),
+         InlineKeyboardButton("5000💰", callback_data='casino_5000')],
+        [InlineKeyboardButton("🎲 Своя", callback_data='casino_custom')],
+        [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
+    ]
+
+    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard), delete_after=60)
+
+
+async def casino_choose_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    data = query.data
+
+    user_data = db.get_user(user.id)
+    robux = user_data['robux'] if user_data else 0
+
+    if data == 'casino_custom':
+        text = (f"🎰 **ВВЕДИ СТАВКУ**\n\n"
+                f"💰 Баланс: {robux:.2f}\n"
+                f"📊 От {CASINO_MIN_BET} до {CASINO_MAX_BET}💰\n"
+                f"🎲 Шанс: {CASINO_WIN_RATE}%\n\n"
+                f"Отправь число:")
+
+        keyboard = [[InlineKeyboardButton("◀ Отмена", callback_data='casino_cancel')]]
+        context.user_data['casino_mode'] = 'waiting_bet'
+
+        await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+    else:
+        bet = int(data.split('_')[1])
+
+        if bet > robux:
+            await query.answer(f"❌ У тебя только {robux:.2f}💰!", show_alert=True)
+            return
+
+        if bet < CASINO_MIN_BET or bet > CASINO_MAX_BET:
+            await query.answer(f"❌ От {CASINO_MIN_BET} до {CASINO_MAX_BET}💰!", show_alert=True)
+            return
+
+        context.user_data['casino_bet'] = bet
+        await casino_choose_side(update, context)
+
+
+async def casino_choose_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    bet = context.user_data.get('casino_bet', 0)
+
+    text = (f"🎰 **ВЫБЕРИ**\n\n"
+            f"💰 Ставка: {bet}💰\n"
+            f"🎲 Шанс: {CASINO_WIN_RATE}%")
+
+    keyboard = [
+        [InlineKeyboardButton("🪙 Орёл", callback_data='casino_heads'),
+         InlineKeyboardButton("🪙 Решка", callback_data='casino_tails')],
+        [InlineKeyboardButton("◀ Назад", callback_data='casino_back')]
+    ]
+
+    await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+
+
+async def casino_play(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    choice = query.data
+
+    bet = context.user_data.get('casino_bet', 0)
+    if not bet:
+        await query.answer("❌ Ошибка!", show_alert=True)
+        return
+
+    user_choice = 0 if choice == 'casino_heads' else 1
+    win, amount, result_text = db.casino_play(user.id, bet, user_choice)
+
+    if win:
+        result = f"🎉 **ТЫ ВЫИГРАЛ!** 🎉\n\n+{amount}💰"
+        alert = f"🎉 +{amount}💰 (шанс был {CASINO_WIN_RATE}%)"
+    else:
+        result = f"😢 **ТЫ ПРОИГРАЛ!** 😢\n\n-{amount}💰"
+        alert = f"😢 -{amount}💰 (шанс был {CASINO_WIN_RATE}%)"
+
+    await query.answer(alert)
+
+    keyboard = [
+        [InlineKeyboardButton("🎰 Ещё", callback_data='casino_play_again')],
+        [InlineKeyboardButton("◀ В меню", callback_data='back_to_menu')]
+    ]
+
+    await edit_and_delete(query, context, result, InlineKeyboardMarkup(keyboard), delete_after=30)
+
+    context.user_data.pop('casino_bet', None)
+    context.user_data.pop('casino_mode', None)
+
+
+# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ КАЗИНО ====================
+
+async def casino_play_again(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    fake_update = update
+    fake_update.message = query.message
+    await show_casino(fake_update, context)
+
+
+async def casino_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    context.user_data.pop('casino_mode', None)
+    context.user_data.pop('casino_bet', None)
+    await query.answer()
+    fake_update = update
+    fake_update.message = query.message
+    await show_casino(fake_update, context)
+
+
+async def casino_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    fake_update = update
+    fake_update.message = query.message
+    await show_casino(fake_update, context)
+
+
+async def casino_handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'casino_mode' not in context.user_data:
+        return
+
+    user = update.effective_user
+    text = update.message.text.strip()
+
+    try:
+        bet = int(text)
+        user_data = db.get_user(user.id)
+        robux = user_data['robux'] if user_data else 0
+
+        if bet < CASINO_MIN_BET or bet > CASINO_MAX_BET:
+            await send_and_delete(update, context, f"❌ От {CASINO_MIN_BET} до {CASINO_MAX_BET}💰!", delete_after=5)
+            return
+
+        if bet > robux:
+            await send_and_delete(update, context, f"❌ У тебя только {robux:.2f}💰!", delete_after=5)
+            return
+
+        context.user_data['casino_bet'] = bet
+        context.user_data.pop('casino_mode', None)
+
+        text = (f"🎰 **ВЫБЕРИ**\n\n"
+                f"💰 Ставка: {bet}💰\n"
+                f"🎲 Шанс: {CASINO_WIN_RATE}%")
+
+        keyboard = [
+            [InlineKeyboardButton("🪙 Орёл", callback_data='casino_heads'),
+             InlineKeyboardButton("🪙 Решка", callback_data='casino_tails')],
+            [InlineKeyboardButton("◀ Отмена", callback_data='casino_cancel')]
+        ]
+
+        await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+
+    except ValueError:
+        await send_and_delete(update, context, "❌ Введи число!", delete_after=3)
+
+
+# ==================== ДУЭЛИ ====================
+
+async def show_duels(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    duel = db.get_pending_duel(user.id)
+
+    if duel:
+        if duel['challenger_id'] == user.id:
+            try:
+                opp = await context.bot.get_chat(duel['opponent_id'])
+                opp_name = opp.first_name
+                opp_username = f" (@{opp.username})" if opp.username else ""
+            except:
+                opp_name = f"ID {duel['opponent_id']}"
+                opp_username = ""
+
+            text = (f"⚔️ **ТВОЯ ДУЭЛЬ** ⚔️\n\n"
+                    f"💰 Ставка: {duel['bet_amount']}💰\n"
+                    f"👤 Противник: {opp_name}{opp_username}\n"
+                    f"⏳ Ожидание ответа...")
+
+            keyboard = [[InlineKeyboardButton("❌ Отменить дуэль", callback_data=f'cancel_duel_{duel["duel_id"]}')]]
+        else:
+            try:
+                chal = await context.bot.get_chat(duel['challenger_id'])
+                chal_name = chal.first_name
+                chal_username = f" (@{chal.username})" if chal.username else ""
+            except:
+                chal_name = f"ID {duel['challenger_id']}"
+                chal_username = ""
+
+            text = (f"⚔️ **ТЕБЯ ВЫЗВАЛИ НА ДУЭЛЬ!** ⚔️\n\n"
+                    f"👤 Противник: {chal_name}{chal_username}\n"
+                    f"💰 Ставка: {duel['bet_amount']}💰\n\n"
+                    f"Что делать?")
+
+            keyboard = [[
+                InlineKeyboardButton("✅ ПРИНЯТЬ ДУЭЛЬ", callback_data=f'accept_duel_{duel["duel_id"]}'),
+                InlineKeyboardButton("❌ ОТКАЗАТЬСЯ", callback_data=f'reject_duel_{duel["duel_id"]}')
+            ]]
+    else:
+        text = ("⚔️ **ДУЭЛИ** ⚔️\n\n"
+                "Нет активных дуэлей.\n\n"
+                "**Как вызвать:**\n"
+                "• `/duel @username 100`\n"
+                "• `/duel ID 100`\n\n"
+                "Пример: `/duel @durov 100`")
+
+        keyboard = []
+
+    keyboard.append([InlineKeyboardButton("◀ Назад в меню", callback_data='back_to_menu')])
+
+    await send_and_delete(update, context, text, InlineKeyboardMarkup(keyboard))
+
+
+async def duel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    message = update.message
+
+    if len(context.args) != 2:
+        await send_and_delete(update, context,
+                              "❌ **Неправильный формат!**\n\n"
+                              "Используй: `/duel @username сумма`\n"
+                              "Или: `/duel ID сумма`\n\n"
+                              "Пример: `/duel @durov 100`",
+                              delete_after=20
+                              )
+        return
+
+    try:
+        target = context.args[0]
+        bet = int(context.args[1])
+
+        if bet < DUEL_BET_MIN or bet > DUEL_BET_MAX:
+            await send_and_delete(update, context, f"❌ Ставка должна быть от {DUEL_BET_MIN} до {DUEL_BET_MAX}💰",
+                                  delete_after=10)
+            return
+
+        challenger = db.get_user(user.id)
+        if not challenger or challenger['robux'] < bet:
+            await send_and_delete(update, context, f"❌ У тебя недостаточно робуксов! Нужно {bet}💰", delete_after=10)
+            return
+
+        opponent = None
+        opponent_user = None
+        found_by = ""
+
+        if target.startswith('@'):
+            opponent = db.get_user_by_username(target)
+            if opponent:
+                found_by = "БД"
+        else:
+            try:
+                user_id = int(target)
+                opponent = db.get_user(user_id)
+                if opponent:
+                    found_by = "БД"
+            except ValueError:
+                pass
+
+        if not opponent and is_group(update):
+            try:
+                if target.startswith('@'):
+                    username = target[1:]
+                    member = await context.bot.get_chat_member(chat.id, username)
+                else:
+                    member = await context.bot.get_chat_member(chat.id, int(target))
+
+                if member and member.user:
+                    db.add_user(member.user.id, member.user.username, member.user.first_name)
+                    opponent = db.get_user(member.user.id)
+                    opponent_user = member.user
+                    found_by = "чат"
+            except:
+                pass
+
+        if not opponent:
+            await send_and_delete(update, context,
+                                  "❌ **Противник не найден!**\n\n"
+                                  "Попроси противника написать /start в боте",
+                                  delete_after=15
+                                  )
+            return
+
+        opponent_id = opponent['user_id']
+
+        if user.id == opponent_id:
+            await send_and_delete(update, context, "❌ Нельзя вызвать самого себя!", delete_after=10)
+            return
+
+        if opponent['robux'] < bet:
+            await send_and_delete(update, context, "❌ У противника недостаточно робуксов!", delete_after=10)
+            return
+
+        if db.get_pending_duel(user.id):
+            await send_and_delete(update, context, "❌ У тебя уже есть активная дуэль!", delete_after=10)
+            return
+
+        if db.get_pending_duel(opponent_id):
+            await send_and_delete(update, context, "❌ У противника уже есть активная дуэль!", delete_after=10)
+            return
+
+        success, msg = db.create_duel(user.id, opponent_id, bet, chat.id)
+
+        if success:
+            duel = db.get_pending_duel(user.id)
+            duel_id = duel['duel_id'] if duel else 0
+
+            opponent_name = opponent['first_name'] or opponent['username'] or str(opponent_id)
+            await send_and_delete(update, context,
+                                  f"✅ **Вызов отправлен!**\n\n"
+                                  f"👤 Противник: {opponent_name}\n"
+                                  f"💰 Ставка: {bet}💰\n"
+                                  f"📍 Найден в: {found_by}\n\n"
+                                  f"⏳ Ожидаем ответа...",
+                                  delete_after=20
+                                  )
+
+            keyboard = [[
+                InlineKeyboardButton("✅ ПРИНЯТЬ ДУЭЛЬ", callback_data=f'accept_duel_{duel_id}'),
+                InlineKeyboardButton("❌ ОТКАЗАТЬСЯ", callback_data=f'reject_duel_{duel_id}')
+            ]]
+
+            try:
+                await context.bot.send_message(
+                    opponent_id,
+                    f"⚔️ **ТЕБЯ ВЫЗВАЛИ НА ДУЭЛЬ!** ⚔️\n\n"
+                    f"👤 Противник: {user.first_name}\n"
+                    f"💰 Ставка: {bet}💰\n\n"
+                    f"**Нажми кнопку чтобы ответить:**",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except:
+                if is_group(update):
+                    mention = ""
+                    if opponent_user and opponent_user.username:
+                        mention = f"@{opponent_user.username}"
+                    elif opponent_user:
+                        mention = f"[{opponent_user.first_name}](tg://user?id={opponent_id})"
+                    else:
+                        mention = opponent_name
+
+                    await send_and_delete(update, context,
+                                          f"⚠️ Не удалось отправить личное сообщение.\n"
+                                          f"{mention}, **прими вызов здесь:**",
+                                          InlineKeyboardMarkup(keyboard),
+                                          delete_after=30
+                                          )
+        else:
+            await send_and_delete(update, context, f"❌ {msg}", delete_after=10)
+
+    except ValueError:
+        await send_and_delete(update, context, "❌ Сумма должна быть числом!", delete_after=10)
+    except Exception as e:
+        logger.error(f"Ошибка в duel_command: {e}")
+        await send_and_delete(update, context, f"❌ Произошла ошибка", delete_after=10)
+
+
+async def accept_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    duel_id = int(query.data.split('_')[2])
+
+    await query.answer()
+
+    duel = db.get_duel_by_id(duel_id)
+    if not duel:
+        await edit_and_delete(query, context, "❌ Дуэль не найдена или истекла", delete_after=10)
+        return
+
+    if user.id != duel['opponent_id']:
+        await edit_and_delete(query, context, "⛔ Это не твоя дуэль!", delete_after=10)
+        return
+
+    challenger = db.get_user(duel['challenger_id'])
+    opponent = db.get_user(duel['opponent_id'])
+
+    if not challenger or challenger['robux'] < duel['bet_amount']:
+        await edit_and_delete(query, context, "❌ У противника недостаточно робуксов! Дуэль отменена.", delete_after=10)
+        db.cancel_duel(duel_id)
+        return
+
+    if not opponent or opponent['robux'] < duel['bet_amount']:
+        await edit_and_delete(query, context, "❌ У тебя недостаточно робуксов! Дуэль отменена.", delete_after=10)
+        db.cancel_duel(duel_id)
+        return
+
+    winner_id = random.choice([duel['challenger_id'], duel['opponent_id']])
+    loser_id = duel['opponent_id'] if winner_id == duel['challenger_id'] else duel['challenger_id']
+
+    success, bet = db.resolve_duel(duel_id, winner_id, loser_id)
+
+    if success:
+        try:
+            winner = await context.bot.get_chat(winner_id)
+            loser = await context.bot.get_chat(loser_id)
+            winner_name = winner.first_name
+            loser_name = loser.first_name
+        except:
+            winner_name = f"ID {winner_id}"
+            loser_name = f"ID {loser_id}"
+
+        result_text = (f"⚔️ **ДУЭЛЬ ЗАВЕРШЕНА!** ⚔️\n\n"
+                       f"🏆 **Победитель:** {winner_name}\n"
+                       f"💔 **Проигравший:** {loser_name}\n"
+                       f"💰 **Выигрыш:** {bet}💰")
+
+        await edit_and_delete(query, context, result_text, delete_after=30)
+
+        try:
+            await context.bot.send_message(winner_id, f"🎉 Ты победил в дуэли и выиграл {bet}💰!")
+            await context.bot.send_message(loser_id, f"😢 Ты проиграл в дуэли и потерял {bet}💰")
+        except:
+            pass
+    else:
+        await edit_and_delete(query, context, "❌ Ошибка при проведении дуэли", delete_after=10)
+
+
+async def reject_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    duel_id = int(query.data.split('_')[2])
+
+    await query.answer()
+
+    duel = db.get_duel_by_id(duel_id)
+    if not duel:
+        await edit_and_delete(query, context, "❌ Дуэль не найдена", delete_after=10)
+        return
+
+    if user.id != duel['opponent_id']:
+        await edit_and_delete(query, context, "⛔ Это не твоя дуэль!", delete_after=10)
+        return
+
+    db.cancel_duel(duel_id)
+    await edit_and_delete(query, context, "❌ Ты отказался от дуэли", delete_after=10)
+
+    try:
+        await context.bot.send_message(duel['challenger_id'], "😢 Противник отказался от дуэли!")
+    except:
+        pass
+
+
+async def cancel_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    duel_id = int(query.data.split('_')[2])
+
+    await query.answer()
+
+    duel = db.get_duel_by_id(duel_id)
+    if not duel:
+        await edit_and_delete(query, context, "❌ Дуэль не найдена", delete_after=10)
+        return
+
+    if user.id != duel['challenger_id']:
+        await edit_and_delete(query, context, "⛔ Ты не можешь отменить эту дуэль!", delete_after=10)
+        return
+
+    db.cancel_duel(duel_id)
+    await edit_and_delete(query, context, "✅ Дуэль отменена", delete_after=10)
+
+    try:
+        await context.bot.send_message(duel['opponent_id'], "❌ Противник отменил дуэль!")
+    except:
+        pass
+
+
+# ==================== СТАТИСТИКА ====================
+
+async def show_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_private(update):
+        await send_and_delete(update, context,
+                              "❌ Статистика доступна только в личных сообщениях с ботом!\nНапиши мне в личку: @roblox_clicker_bot")
+        return
+
+    user = update.effective_user
+    user_data = db.get_user(user.id)
+
+    if user_data:
+        joined = datetime.fromisoformat(user_data['joined_date']).strftime("%d.%m.%Y")
+        wins = user_data['wins']
+        losses = user_data['losses']
+        casino_wins = user_data['casino_wins']
+        casino_losses = user_data['casino_losses']
+        win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+        casino_rate = (casino_wins / (casino_wins + casino_losses) * 100) if (casino_wins + casino_losses) > 0 else 0
+
+        text = (f"📊 **ТВОЯ СТАТИСТИКА**\n\n"
+                f"👤 Игрок: {user.first_name}\n"
+                f"🆔 ID: `{user.id}`\n"
+                f"📅 С: {joined}\n"
+                f"💰 Робуксы: {user_data['robux']:.2f}\n"
+                f"👆 Тапов: {user_data['taps']}\n"
+                f"⚡ Сила: {user_data['click_power']}x\n"
+                f"🤖 Автокликеров: {user_data['auto_clickers']}\n"
+                f"⚔️ Дуэли: {wins}W / {losses}L ({win_rate:.1f}%)\n"
+                f"🎰 Казино: {casino_wins}W / {casino_losses}L ({casino_rate:.1f}%)")
+    else:
+        text = "❌ Нет данных"
+
+    await send_and_delete(update, context, text, delete_after=60)
+
+
+# ==================== ПОКУПКИ ====================
+
+async def handle_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    item = query.data.replace('buy_', '')
+
+    success, msg = db.buy_item(user.id, item)
+
+    if success:
+        await query.answer("✅ Куплено!")
+        user_data = db.get_user(user.id)
+        robux = user_data['robux'] if user_data else 0
+        click_power = user_data['click_power'] if user_data else 1
+        tap_value = TAP_BASE_VALUE * click_power
+
+        text = (f"🏪 **МАГАЗИН**\n\n"
+                f"💰 Баланс: {robux:.2f}💰\n"
+                f"⚡ Тап: {tap_value:.2f}💰 (x{click_power})\n\n"
+                f"⚡ Усиление - {CLICK_POWER_PRICE}💰\n"
+                f"🤖 Автокликер - {AUTO_CLICKER_PRICE}💰")
+
+        keyboard = [
+            [InlineKeyboardButton("⚡ Купить усиление", callback_data='buy_click_power')],
+            [InlineKeyboardButton("🤖 Купить автокликер", callback_data='buy_auto_clicker')],
+            [InlineKeyboardButton("◀ Назад", callback_data='back_to_menu')]
+        ]
+
+        await edit_and_delete(query, context, text, InlineKeyboardMarkup(keyboard))
+    else:
+        await query.answer(msg, show_alert=True)
+
+
+# ==================== АВТОКЛИКЕР ====================
+
+async def auto_clicker_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        db.cursor.execute("SELECT user_id, auto_clickers FROM users WHERE auto_clickers > 0")
+        users = db.cursor.fetchall()
+
+        for user_id, clicks in users:
+            db.cursor.execute("UPDATE users SET robux = robux + ? WHERE user_id = ?", (clicks, user_id))
+
+        db.conn.commit()
+        if users:
+            logger.info(f"🔄 Автокликер: {len(users)} пользователей, +{sum(users)}💰")
+    except Exception as e:
+        logger.error(f"❌ Ошибка автокликера: {e}")
+
+
+# ==================== ГЛАВНЫЙ ОБРАБОТЧИК КНОПОК ====================
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+
+    try:
+        if data == 'back_to_menu':
+            await query.answer()
+            if is_private(update):
+                fake_update = update
+                fake_update.message = query.message
+                await show_main_menu(fake_update, context)
+            else:
+                await edit_and_delete(query, context, "❌ Это меню доступно только в личных сообщениях!")
+
+        elif data == 'refresh_top':
+            await query.answer()
+            await show_top(update, context)
+
+        elif data.startswith('casino_'):
+            if data in ['casino_cancel', 'casino_back']:
+                if data == 'casino_cancel':
+                    await casino_cancel(update, context)
+                else:
+                    await casino_back(update, context)
+            elif data == 'casino_play_again':
+                await casino_play_again(update, context)
+            elif data in ['casino_10', 'casino_50', 'casino_100', 'casino_500', 'casino_1000', 'casino_5000',
+                          'casino_custom']:
+                await casino_choose_bet(update, context)
+            elif data in ['casino_heads', 'casino_tails']:
+                await casino_play(update, context)
+
+        elif data.startswith('buy_'):
+            if not is_private(update):
+                await query.answer("❌ Магазин только в личке!", show_alert=True)
+                return
+            await handle_buy(update, context)
+
+        elif data.startswith('accept_duel_'):
+            await accept_duel(update, context)
+        elif data.startswith('reject_duel_'):
+            await reject_duel(update, context)
+        elif data.startswith('cancel_duel_'):
+            await cancel_duel(update, context)
+
+    except Exception as e:
+        logger.error(f"Ошибка в button_handler: {e}")
+        await query.answer("❌ Произошла ошибка", show_alert=True)
+
+
+# ==================== ОБРАБОТЧИК ТЕКСТА ====================
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    chat_type = update.effective_chat.type
+
+    if 'casino_mode' in context.user_data:
+        await casino_handle_message(update, context)
+        return
+
+    if chat_type in ['group', 'supergroup']:
+        if text == "⚔️ Дуэли":
+            await show_duels(update, context)
+        elif text == "🎰 Казино":
+            await show_casino(update, context)
+        elif text == "🏆 Топ игроков":
+            await show_top(update, context)
+        elif text == "ℹ️ Информация":
+            await show_info(update, context)
+    else:
+        if text == "👆 ТАПНУТЬ":
+            await handle_tap(update, context)
+        elif text == "🏪 Магазин":
+            await show_shop(update, context)
+        elif text == "⚔️ Дуэли":
+            await show_duels(update, context)
+        elif text == "🎰 Казино":
+            await show_casino(update, context)
+        elif text == "📊 Статистика":
+            await show_stats(update, context)
+        elif text == "🏆 Топ игроков":
+            await show_top(update, context)
+        elif text == "ℹ️ Информация":
+            await show_info(update, context)
+
+
+# ==================== ФУНКЦИЯ АВТОПЕРЕЗАПУСКА ====================
+
+async def run_bot_with_restart():
+    max_restarts = 10
+    restart_count = 0
+
+    while restart_count < max_restarts:
+        try:
+            logger.info(f"🚀 Запуск бота (попытка {restart_count + 1})...")
+
+            app = Application.builder().token(BOT_TOKEN).build()
+
+            app.add_handler(CommandHandler("start", start))
+            app.add_handler(CommandHandler("admin", admin_command))
+            app.add_handler(CommandHandler("duel", duel_command))
+            app.add_handler(CommandHandler("give", give_command))
+            app.add_handler(CommandHandler("top", show_top))
+
+            app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+            app.add_handler(CallbackQueryHandler(button_handler))
+
+            if app.job_queue:
+                app.job_queue.run_repeating(auto_clicker_job, interval=10, first=10)
+
+            logger.info("✅ Бот запущен!")
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling()
+
+            while True:
+                await asyncio.sleep(1)
+
+        except (NetworkError, TimedOut) as e:
+            logger.error(f"🌐 Сетевая ошибка: {e}")
+            restart_count += 1
+            logger.info(f"🔄 Перезапуск через 5 секунд...")
+            await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка: {e}")
+            logger.error(traceback.format_exc())
+            restart_count += 1
+            logger.info(f"🔄 Перезапуск через 10 секунд...")
+            await asyncio.sleep(10)
+
+        finally:
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except:
+                pass
+
+    logger.critical("💀 Превышено количество перезапусков. Бот остановлен.")
+
+
+# ==================== ЗАПУСК ====================
+
+def main():
+    try:
+        asyncio.run(run_bot_with_restart())
+    except KeyboardInterrupt:
+        logger.info("🛑 Бот остановлен пользователем")
+    except Exception as e:
+        logger.critical(f"💥 Фатальная ошибка: {e}")
+        logger.critical(traceback.format_exc())
+
+
+if __name__ == "__main__":
+    main()
